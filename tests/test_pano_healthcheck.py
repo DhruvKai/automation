@@ -96,7 +96,8 @@ SESSION_INFO = """<response status="success"><result><num-max>100000</num-max><n
 
 
 REST_DEVICE_GROUPS = {"@status": "success", "@code": "19", "result": {"@count": "1", "entry": [
-    {"@name": "DG-Branch", "devices": {"entry": [{"@name": "001"}, {"@name": "002"}]}}]}}
+    {"@name": "DG-Branch", "devices": {"entry": [{"@name": "001"}, {"@name": "002"}]}},
+    {"@name": "DG-DC"}, {"@name": "DG-Lab"}]}}
 
 REST_TEMPLATE_STACKS = {"@status": "success", "result": {"entry": [
     {"@name": "TS-Branch", "devices": {"entry": [{"@name": "001"}]}}]}}
@@ -438,13 +439,31 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("SECRET-KEY", html_text)
         self.assertTrue(all(h.get("X-PAN-KEY") == "SECRET-KEY" for _, h in fake.sent))
 
+    def rule_calls(self, fake):
+        return [p.get("device-group", "shared") for p, _ in fake.sent if "location" in p
+                and p["location"] in ("shared", "device-group")]
+
+    def test_quick_limits_device_groups(self):
+        code, fake, out_dir, stdout = self.run_main("--quick", mode="rest")
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(self.rule_calls(fake), ["shared", "shared", "DG-Branch", "DG-Branch", "DG-DC", "DG-DC"])
+        self.assertIn("Limited run: security rules for shared + 2 of 3 device groups", stdout)
+        report_dir = next(p for p in out_dir.iterdir() if p.is_dir())
+        self.assertIn("Limited run", (report_dir / "report.html").read_text(encoding="utf-8"))
+
+    def test_device_groups_option(self):
+        code, fake, _, stdout = self.run_main("--device-groups", "DG-Lab,Nope", "--sections", "rules", mode="rest")
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(self.rule_calls(fake), ["shared", "shared", "DG-Lab", "DG-Lab"])
+        self.assertIn("not found on Panorama: Nope", stdout)
+
     def test_rest_diagnose(self):
         fake = FakePanorama()
         client = ph.PanoramaClient(make_settings(api_mode="rest"), transport=fake, log=lambda *_: None)
         with contextlib.redirect_stdout(io.StringIO()) as out:
             code = ph.diagnose(client)
         self.assertEqual(code, 0, out.getvalue())
-        self.assertIn("PASS  Panorama/DeviceGroups (1: DG-Branch)", out.getvalue())
+        self.assertIn("PASS  Panorama/DeviceGroups (3: DG-Branch, DG-DC, DG-Lab)", out.getvalue())
 
     def test_rules_collected_when_op_is_denied(self):
         fake = FakePanorama()

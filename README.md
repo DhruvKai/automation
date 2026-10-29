@@ -129,11 +129,25 @@ This prints every API call a full run would make. It sends nothing to Panorama.
 
 ### 7. Run the health check
 
+For a fast proof-of-concept run, start with `--quick`. It collects rules for shared plus only the first 2 device groups, which is about 8 calls:
+
+```
+python pano_healthcheck.py --quick
+```
+
+To pick the device groups yourself (names are case-sensitive and must match Panorama exactly):
+
+```
+python pano_healthcheck.py --device-groups "US,VOOR"
+```
+
+For the full report, covering every device group:
+
 ```
 python pano_healthcheck.py
 ```
 
-Progress is printed per section. At the end, the script prints the report folder, for example:
+A limited run says so at the top of the report, so it can't be mistaken for a full one. Progress is printed for each rule call, as `[n/total] device group, rulebase, rule count, time`. At the end, the script prints the report folder, for example:
 
 ```
 Done: 8 read-only API calls, 6 firewalls, 9 findings (critical 0, high 2, medium 3).

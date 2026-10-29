@@ -597,14 +597,19 @@ PANORAMA_DEVICE_XPATH = "/config/devices/entry[@name='localhost.localdomain']"
 SECTIONS = ["panorama", "devices", "sync", "jobs", "collectors", "rules", "logs", "targeted"]
 
 
+QUICK_DEVICE_GROUPS = 2  # --quick: rules for shared + this many device groups
+
+
 class Collector:
-    def __init__(self, client, settings):
+    def __init__(self, client, settings, only_groups=None, max_groups=None):
+        self.only_groups = only_groups or []  # --device-groups: collect rules for these only
+        self.max_groups = max_groups          # --quick: cap on device groups
         self.client = client
         self.settings = settings
         self.data = {
             "panorama": {}, "panorama_ha": {}, "devices": [], "sync": [], "jobs": [],
             "log_collectors": [], "rules": [], "system_logs": [], "config_logs": [],
-            "resources": [], "errors": [], "unavailable": [],
+            "resources": [], "errors": [], "unavailable": [], "scope_note": "",
         }
         self._device_groups = None
         self._dg_entries = None  # REST: device-group entry dicts
@@ -724,7 +729,7 @@ class Collector:
             self._device_groups = [e.get("name") for e in top_entries(names) if e.get("name")]
         locations = [("shared", "/config/shared")]
         locations += [(dg, f"{PANORAMA_DEVICE_XPATH}/device-group/entry[@name='{dg}']")
-                      for dg in self._device_groups]
+                      for dg in self._select_groups(self._device_groups)]
         if self.client.dry_run and not self._device_groups:
             print("  [dry-run] + 2 config show calls per device group (pre/post rulebase)")
 
@@ -799,6 +804,7 @@ class Collector:
         except ApiError as exc:
             self._error("rules (device groups)", exc)
             names = []
+        names = self._select_groups(names)
         locations = [("shared", {"location": "shared"})]
         locations += [(name, {"location": "device-group", "device-group": name}) for name in names]
         if self.client.dry_run and not names:
@@ -829,6 +835,24 @@ class Collector:
                     rows.append(rule_row(location, rulebase, position, json_to_element("entry", entry)))
                 self._progress(step, total, location, rulebase, len(rows) - before, started)
         self.data["rules"] = rows
+
+    def _select_groups(self, names):
+        """Apply --device-groups and --quick to the device groups whose rules are collected."""
+        selected = list(names)
+        if self.only_groups:
+            missing = [g for g in self.only_groups if names and g not in names]
+            if missing:
+                self._error("rules (device groups)",
+                            ApiError(f"device group(s) not found on Panorama: {', '.join(missing)}"))
+            selected = [g for g in self.only_groups if not names or g in names]
+        if self.max_groups is not None:
+            selected = selected[: self.max_groups]
+        if selected != list(names):
+            note = (f"Limited run: security rules for shared + {len(selected)} of {len(names)} device groups "
+                    f"({', '.join(selected) or 'none'})")
+            self.data["scope_note"] = note
+            print(f"  {note}")
+        return selected
 
     def _progress(self, step, total, location, rulebase, count, started):
         if not self.client.dry_run:
@@ -1202,6 +1226,7 @@ th { position:sticky; top:0; background:var(--card); font-weight:600; }
 .sev-critical { color:var(--crit); font-weight:700; } .sev-high { color:var(--high); font-weight:700; }
 .sev-medium { color:var(--med); font-weight:600; } .sev-low { color:var(--low); } .sev-info { color:var(--info); }
 .empty { color:var(--muted); font-style:italic; }
+.scope { border-left:3px solid var(--med); padding:6px 10px; background:var(--card); }
 details summary { cursor:pointer; color:var(--muted); margin-top:8px; }
 """
 
@@ -1289,6 +1314,7 @@ def write_html(path, data, findings, settings, calls, started):
 <h1>Panorama Health Check</h1>
 <div class="meta">Panorama {html.escape(settings.host)} &middot; collected {started:%Y-%m-%d %H:%M:%S}
  &middot; {settings.api_mode.upper()} API &middot; {len(calls)} read-only API calls</div>
+{f'<p class="scope"><b>{html.escape(data["scope_note"])}.</b> Run without --quick/--device-groups for the full report.</p>' if data.get("scope_note") else ""}
 <nav>{nav}</nav>
 <div class="tiles">{tiles_html}</div>
 {body}
@@ -1422,6 +1448,10 @@ def parse_args(argv):
                    help="also query each connected firewall through Panorama (overrides ENABLE_TARGETED)")
     p.add_argument("--format", default="html,csv", help="html, csv or html,csv (default)")
     p.add_argument("--output-dir", help="override OUTPUT_DIR")
+    p.add_argument("--quick", action="store_true",
+                   help=f"fast proof-of-concept run: rules for shared + the first {QUICK_DEVICE_GROUPS} device groups")
+    p.add_argument("--device-groups", default="",
+                   help="comma-separated device groups to collect rules for (default: all)")
     return p.parse_args(argv)
 
 
@@ -1462,7 +1492,10 @@ def main(argv=None, transport=None):
         print(f"Dry run against {settings.host}: planned read-only calls\n")
 
     started = datetime.now()
-    data = Collector(client, settings).run(sections)
+    only_groups = [g.strip() for g in args.device_groups.split(",") if g.strip()]
+    collector = Collector(client, settings, only_groups=only_groups,
+                          max_groups=QUICK_DEVICE_GROUPS if args.quick else None)
+    data = collector.run(sections)
 
     if args.dry_run:
         print(f"\nDry run complete: {len(client.calls)} calls listed, nothing sent, no report written.")
@@ -1480,6 +1513,8 @@ def main(argv=None, transport=None):
     sev = Counter(f["severity"] for f in findings)
     print(f"\nDone: {len(client.calls)} read-only API calls, {len(data['devices'])} firewalls, "
           f"{len(findings)} findings (critical {sev['critical']}, high {sev['high']}, medium {sev['medium']}).")
+    if data["scope_note"]:
+        print(data["scope_note"] + ".")
     print(f"Report: {out_dir}")
     return 0
 
