@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Read-only Panorama health-check collector (proof of concept).
 
-Collects firewall health data from Panorama through the PAN-OS XML API and
-writes an HTML report and/or CSV files. Python standard library only.
+Collects firewall health data from Panorama through the PAN-OS REST API
+(API_MODE=rest, the default) or XML API (API_MODE=xml) and writes an HTML
+report and/or CSV files. Python standard library only.
 
-Every request passes through guard() before anything is sent. Only
-allowlisted `show` operational commands, config `show`/`get` reads and log
-queries are permitted; anything else raises ReadOnlyViolation.
+Every request passes a guard before anything is sent. XML: only allowlisted
+`show` operational commands, config `show`/`get` reads and log queries
+(guard()). REST: only GET on allowlisted endpoints (guard_rest()). Anything
+else raises ReadOnlyViolation.
 
 Usage:
     python pano_healthcheck.py --diagnose
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
 import os
 import re
 import socket
@@ -29,7 +32,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,6 +47,9 @@ DEFAULTS = {
     "PANORAMA_PORT": "443",
     "PANORAMA_API_KEY": "",
     "ALLOWED_HOSTS": "",
+    "API_MODE": "rest",
+    "REST_VERSION": "v11.0",
+    "DEVICE_GROUPS": "",
     "VERIFY_TLS": "false",
     "CA_BUNDLE": "",
     "BYPASS_PROXY": "true",
@@ -88,14 +94,19 @@ class Settings:
     output_dir: Path
     key_source: str = ""
     http_method: str = "POST"
+    api_mode: str = "xml"
+    rest_version: str = "v11.0"
+    device_groups: list = field(default_factory=list)
 
     def key_label(self):
         """Masked key description, for comparing with the key used in curl."""
         if not self.api_key:
             return "no API key"
-        sent = "X-PAN-KEY header" if self.key_in_header else ("URL query" if self.http_method == "GET" else "POST body")
-        return (f"API key ...{self.api_key[-4:]} ({len(self.api_key)} chars, from {self.key_source}), "
-                f"sent via {self.http_method} in {sent}")
+        if self.api_mode == "rest":
+            sent = "REST GET, X-PAN-KEY header"
+        else:
+            sent = f"XML {self.http_method}, " + ("X-PAN-KEY header" if self.key_in_header else "POST body")
+        return f"API key ...{self.api_key[-4:]} ({len(self.api_key)} chars, from {self.key_source}), sent via {sent}"
 
 
 def load_env_file(path):
@@ -145,6 +156,14 @@ def load_settings(env_path, environ=None, require_key=True):
     http_method = values["HTTP_METHOD"].strip().upper()
     if http_method not in ("POST", "GET"):
         raise ConfigError("HTTP_METHOD must be POST or GET")
+    if http_method == "GET" and not _bool(values["KEY_IN_HEADER"]):
+        raise ConfigError("HTTP_METHOD=GET needs KEY_IN_HEADER=true; the key is never put in a URL")
+    api_mode = values["API_MODE"].strip().lower()
+    if api_mode not in ("rest", "xml"):
+        raise ConfigError("API_MODE must be rest or xml")
+    rest_version = values["REST_VERSION"].strip()
+    if not re.fullmatch(r"v\d+\.\d+", rest_version):
+        raise ConfigError("REST_VERSION must look like v11.0 (your Panorama's major.minor version)")
 
     output_dir = Path(values["OUTPUT_DIR"])
     if not output_dir.is_absolute():
@@ -170,6 +189,9 @@ def load_settings(env_path, environ=None, require_key=True):
             output_dir=output_dir,
             key_source=key_source,
             http_method=http_method,
+            api_mode=api_mode,
+            rest_version=rest_version,
+            device_groups=[g.strip() for g in values["DEVICE_GROUPS"].split(",") if g.strip()],
         )
     except ValueError as exc:
         raise ConfigError(f"Invalid number in .env: {exc}") from None
@@ -251,6 +273,37 @@ def guard(params):
             raise ReadOnlyViolation(f"log action '{action}' is not allowed")
 
 
+# The only REST endpoints this tool can ever call, and only with GET.
+REST_ENDPOINTS = frozenset({
+    "Objects/Addresses",            # diagnose baseline (the call known to work)
+    "Policies/SecurityPreRules",
+    "Policies/SecurityPostRules",
+    "Panorama/DeviceGroups",
+    "Panorama/TemplateStacks",
+})
+REST_QUERY_KEYS = {"location", "device-group"}
+REST_LOCATIONS = {"shared", "device-group", "panorama"}
+DEVICE_GROUP_RE = re.compile(r"[^\x00-\x1f\x7f]{1,63}")
+
+
+def guard_rest(method, endpoint, query):
+    """Raise ReadOnlyViolation unless this is a GET on an allowlisted REST endpoint."""
+    if method != "GET":
+        raise ReadOnlyViolation(f"REST method '{method}' is not allowed (read-only tool, GET only)")
+    if endpoint not in REST_ENDPOINTS:
+        raise ReadOnlyViolation(f"REST endpoint not in allowlist: {endpoint!r}")
+    extra = set(query) - REST_QUERY_KEYS
+    if extra:
+        raise ReadOnlyViolation(f"REST query parameters not allowed: {sorted(extra)}")
+    location = query.get("location")
+    if location is not None and location not in REST_LOCATIONS:
+        raise ReadOnlyViolation(f"REST location '{location}' is not allowed")
+    if (location == "device-group") != ("device-group" in query):
+        raise ReadOnlyViolation("device-group must be given exactly when location=device-group")
+    if "device-group" in query and not DEVICE_GROUP_RE.fullmatch(query["device-group"]):
+        raise ReadOnlyViolation(f"invalid device-group name: {query['device-group']!r}")
+
+
 # --------------------------------------------------------------------------
 # API client
 # --------------------------------------------------------------------------
@@ -274,13 +327,23 @@ API_ERROR_CODES = {
     "21": "Internal error",
     "22": "Session timed out",
     "400": "Bad request",
+    "401": "Unauthorized - invalid API key",
     "403": "Forbidden - invalid API key or insufficient admin rights",
+    "404": "Not found",
 }
 
 ROLE_PERMISSION = {"op": "Operational Requests", "config": "Configuration", "log": "Log"}
 
 
 def error_hint(code, req_type, message=""):
+    if req_type.startswith("rest:"):
+        endpoint = req_type[5:]
+        if code in ("401", "403", "16"):
+            return (f"The admin role does not allow REST API '{endpoint}'. On Panorama: Panorama > Admin "
+                    f"Roles > <role> > REST API tab > {endpoint.replace('/', ' > ')} (this tool only sends GET).")
+        if code == "404":
+            return f"'{endpoint}' was not found; check REST_VERSION in .env and https://<panorama>/restapi-doc."
+        return ""
     perm = ROLE_PERMISSION.get(req_type, "the matching")
     if code in ("16", "403"):
         if "not authorized for user role" in message:
@@ -313,15 +376,6 @@ class ApiError(Exception):
         super().__init__(text)
 
 
-class HttpStatusError(Exception):
-    """Non-XML HTTP error from the transport (e.g. a proxy or web server page)."""
-
-    def __init__(self, status, reason):
-        self.status = status
-        self.reason = reason
-        super().__init__(f"HTTP {status} {reason}")
-
-
 def _response_message(root):
     parts = []
     for msg in root.iter("msg"):
@@ -332,7 +386,7 @@ def _response_message(root):
 
 
 class PanoramaClient:
-    """Sends throttled, guarded, one-at-a-time requests to the XML API."""
+    """Sends throttled, guarded, one-at-a-time requests to the XML or REST API."""
 
     def __init__(self, settings, dry_run=False, transport=None, log=print):
         self.settings = settings
@@ -352,53 +406,32 @@ class PanoramaClient:
         if s.bypass_proxy:
             handlers.append(urllib.request.ProxyHandler({}))
         opener = urllib.request.build_opener(*handlers)
-        url = f"https://{s.host}:{s.port}/api/"
+        base = f"https://{s.host}:{s.port}"
 
-        def send(body, headers, method="POST"):
+        def send(path, query, headers, method="POST"):
+            """Return (http_status, body). The key is only ever in headers or the POST body."""
             if method == "GET":
-                req = urllib.request.Request(f"{url}?{body.decode()}", headers=headers, method="GET")
+                req = urllib.request.Request(f"{base}{path}?{query}", headers=headers, method="GET")
             else:
-                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                req = urllib.request.Request(f"{base}{path}", data=query.encode(), headers=headers,
+                                             method="POST")
             try:
                 with opener.open(req, timeout=s.timeout) as resp:
-                    return resp.read()
+                    return resp.status, resp.read()
             except urllib.error.HTTPError as exc:
-                # PAN-OS returns an XML error body with 4xx codes; parse it if present.
-                payload = exc.read()
-                if payload.lstrip().startswith(b"<"):
-                    return payload
-                raise HttpStatusError(exc.code, exc.reason) from None
+                # PAN-OS sends an XML/JSON error body with 4xx codes.
+                return exc.code, exc.read()
 
         return send
 
-    def request(self, params, label):
-        guard(params)
-        self.calls.append(label)
-        if self.dry_run:
-            self.log(f"  [dry-run] {label}")
-            return ET.Element("result")
-
+    def _send(self, path, query, headers, method):
+        """Throttle, send once, retry once on network errors only. Returns (status, body)."""
         wait = self.settings.request_delay - (time.monotonic() - self._last_request)
         if wait > 0:
             time.sleep(wait)
-
-        body_params = dict(params)
-        method = self.settings.http_method
-        headers = {"Content-Type": "application/x-www-form-urlencoded"} if method == "POST" else {}
-        if self.settings.key_in_header:
-            headers["X-PAN-KEY"] = self.settings.api_key
-        else:
-            body_params["key"] = self.settings.api_key
-        body = urllib.parse.urlencode(body_params).encode()
-
-        payload = None
         for attempt in (1, 2):
             try:
-                payload = self._transport(body, headers, method)
-                break
-            except HttpStatusError as exc:
-                raise ApiError(f"HTTP {exc.status} {exc.reason}", code=str(exc.status),
-                               req_type=params["type"]) from None
+                return self._transport(path, query, headers, method)
             except (urllib.error.URLError, socket.timeout, ConnectionError) as exc:
                 if attempt == 2:
                     reason = getattr(exc, "reason", exc)
@@ -407,10 +440,29 @@ class PanoramaClient:
             finally:
                 self._last_request = time.monotonic()
 
+    def request(self, params, label):
+        """XML API request. Returns the <result> element."""
+        guard(params)
+        self.calls.append(label)
+        if self.dry_run:
+            self.log(f"  [dry-run] {label}")
+            return ET.Element("result")
+
+        body_params = dict(params)
+        method = self.settings.http_method
+        headers = {"Content-Type": "application/x-www-form-urlencoded"} if method == "POST" else {}
+        if self.settings.key_in_header:
+            headers["X-PAN-KEY"] = self.settings.api_key
+        else:
+            body_params["key"] = self.settings.api_key  # POST body only; load_settings forbids GET here
+        status, payload = self._send("/api/", urllib.parse.urlencode(body_params), headers, method)
+
         try:
             root = ET.fromstring(payload)
         except ET.ParseError:
             snippet = payload[:120].decode("utf-8", "replace").replace("\n", " ")
+            if status >= 400:
+                raise ApiError(f"HTTP {status}: {snippet!r}", code=str(status), req_type=params["type"]) from None
             raise ApiError(f"response was not XML (proxy or wrong host?): {snippet!r}") from None
 
         if root.get("status") != "success":
@@ -428,6 +480,35 @@ class PanoramaClient:
 
     def config_show(self, xpath):
         return self.request({"type": "config", "action": "show", "xpath": xpath}, f"config show {xpath}")
+
+    def rest_get(self, endpoint, query):
+        """REST API GET. Returns the list of entry dicts."""
+        guard_rest("GET", endpoint, query)
+        qs = urllib.parse.urlencode(query)
+        label = f"rest GET {endpoint}" + (f"?{qs}" if qs else "")
+        self.calls.append(label)
+        if self.dry_run:
+            self.log(f"  [dry-run] {label}")
+            return []
+
+        req_type = f"rest:{endpoint}"
+        headers = {"X-PAN-KEY": self.settings.api_key, "Accept": "application/json"}
+        status, payload = self._send(f"/restapi/{self.settings.rest_version}/{endpoint}", qs, headers, "GET")
+        try:
+            doc = json.loads(payload)
+        except ValueError:
+            snippet = payload[:120].decode("utf-8", "replace").replace("\n", " ")
+            raise ApiError(f"HTTP {status}, response was not JSON: {snippet!r}",
+                           code=str(status) if status >= 400 else "", req_type=req_type) from None
+        if not isinstance(doc, dict):
+            doc = {}
+        if status >= 400 or str(doc.get("@status", "")).lower() != "success":
+            message = doc.get("message") or doc.get("msg") or str(doc)[:200]
+            code = str(status) if status >= 400 else str(doc.get("code", doc.get("@code", "")))
+            raise ApiError(f"{endpoint}: {message}", code=code, req_type=req_type)
+        result = doc.get("result") or {}
+        entries = result.get("entry", []) if isinstance(result, dict) else []
+        return entries if isinstance(entries, list) else [entries]
 
     def log_query(self, log_type, query, nlogs):
         """Enqueue a log query, poll the job, and return the <entry> elements."""
@@ -480,6 +561,23 @@ def flatten(elem, prefix=""):
     return out
 
 
+def json_to_element(tag, value):
+    """Convert a REST API JSON object to the equivalent XML element ('@x' keys become attributes)."""
+    el = ET.Element(tag)
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.startswith("@"):
+                el.set(key[1:], str(child))
+            elif key == "#text":
+                el.text = str(child)
+            else:
+                for item in child if isinstance(child, list) else [child]:
+                    el.append(json_to_element(key, item))
+    elif value is not None:
+        el.text = str(value)
+    return el
+
+
 def top_entries(elem):
     """Return the shallowest list of <entry> children below `elem`."""
     level = [elem]
@@ -507,21 +605,30 @@ class Collector:
         self.data = {
             "panorama": {}, "panorama_ha": {}, "devices": [], "sync": [], "jobs": [],
             "log_collectors": [], "rules": [], "system_logs": [], "config_logs": [],
-            "resources": [], "errors": [],
+            "resources": [], "errors": [], "unavailable": [],
         }
         self._device_groups = None
+        self._dg_entries = None  # REST: device-group entry dicts
+        self._panorama_query = {"location": "panorama"}  # REST: query form that worked for Panorama/*
 
     def run(self, sections):
+        rest = self.settings.api_mode == "rest"
         for name in SECTIONS:
             if name not in sections:
                 continue
+            collect = getattr(self, f"collect_{name}_rest" if rest else f"collect_{name}", None)
+            if collect is None:
+                self.data["unavailable"].append(name)
+                continue
             print(f"Collecting: {name}")
             try:
-                getattr(self, f"collect_{name}")()
+                collect()
             except ReadOnlyViolation:
                 raise
             except ApiError as exc:
                 self._error(name, exc)
+        if self.data["unavailable"]:
+            print(f"Skipped (not available through the REST API): {', '.join(self.data['unavailable'])}")
         return self.data
 
     def _error(self, section, exc):
@@ -634,6 +741,82 @@ class Collector:
                 rules_el = next(result.iter("rules"), result)
                 for position, entry in enumerate(rules_el.findall("entry"), start=1):
                     rows.append(rule_row(location, rulebase, position, entry))
+        self.data["rules"] = rows
+
+    # ---- REST API mode: only configuration data exists in the REST API ----
+
+    def _rest_device_groups(self):
+        """Device-group entries from Panorama/DeviceGroups, else names from DEVICE_GROUPS in .env."""
+        if self._dg_entries is not None:
+            return self._dg_entries
+        last = None
+        for query in ({"location": "panorama"}, {}):
+            try:
+                self._dg_entries = self.client.rest_get("Panorama/DeviceGroups", query)
+                self._panorama_query = query
+                return self._dg_entries
+            except ApiError as exc:
+                last = exc
+                if exc.code in ("401", "403", "16"):
+                    break  # a permission problem; another query form will not help
+        if self.settings.device_groups:
+            self._error("device groups", last)
+            print(f"  using DEVICE_GROUPS from .env: {', '.join(self.settings.device_groups)}")
+            self._dg_entries = [{"@name": name} for name in self.settings.device_groups]
+            return self._dg_entries
+        self._dg_entries = []
+        raise ApiError(f"could not list device groups ({last}). "
+                       "Set DEVICE_GROUPS=<dg1>,<dg2> in .env to collect device-group rules anyway.")
+
+    def collect_devices_rest(self):
+        rows = {}
+
+        def add(serial, column, group):
+            row = rows.setdefault(serial, {"serial": serial, "device-group": "", "template-stack": ""})
+            row[column] = f"{row[column]}, {group}" if row[column] else group
+
+        for dg in self._rest_device_groups():
+            group = json_to_element("entry", dg)
+            for dev in group.findall("./devices/entry"):
+                add(dev.get("name", ""), "device-group", group.get("name", ""))
+        try:
+            for stack in self.client.rest_get("Panorama/TemplateStacks", self._panorama_query):
+                group = json_to_element("entry", stack)
+                for dev in group.findall("./devices/entry"):
+                    add(dev.get("name", ""), "template-stack", group.get("name", ""))
+        except ApiError as exc:
+            self._error("devices (template stacks)", exc)
+        self.data["devices"] = list(rows.values())
+
+    def collect_rules_rest(self):
+        try:
+            names = [e.get("@name") for e in self._rest_device_groups() if e.get("@name")]
+        except ApiError as exc:
+            self._error("rules (device groups)", exc)
+            names = []
+        locations = [("shared", {"location": "shared"})]
+        locations += [(name, {"location": "device-group", "device-group": name}) for name in names]
+        if self.client.dry_run and not names:
+            print("  [dry-run] + 2 REST GET calls per device group (pre/post rules)")
+
+        rows = []
+        denied = set()
+        for location, query in locations:
+            for rulebase, endpoint in (("pre-rulebase", "Policies/SecurityPreRules"),
+                                       ("post-rulebase", "Policies/SecurityPostRules")):
+                if endpoint in denied:
+                    continue
+                try:
+                    entries = self.client.rest_get(endpoint, query)
+                except ApiError as exc:
+                    if exc.code in ("401", "403", "16"):
+                        denied.add(endpoint)  # don't repeat a denied call for every device group
+                    self._error(f"rules ({location} {rulebase})", exc)
+                    continue
+                for position, entry in enumerate(entries, start=1):
+                    if entry.get("@location") and entry["@location"] != query["location"]:
+                        continue  # inherited from another location; collected there
+                    rows.append(rule_row(location, rulebase, position, json_to_element("entry", entry)))
         self.data["rules"] = rows
 
     def collect_logs(self):
@@ -788,7 +971,7 @@ def evaluate(data):
 
     for dev in devices:
         name = dev.get("hostname") or dev.get("serial", "")
-        if dev.get("connected", "") != "yes":
+        if "connected" in dev and dev["connected"] != "yes":
             _finding(findings, "critical", "connectivity", name, "Firewall not connected to Panorama",
                      f"serial {dev.get('serial', '')}, ip {dev.get('ip-address', '')}")
         if dev.get("deactivated") == "yes":
@@ -878,6 +1061,10 @@ def evaluate(data):
 
     for err in data["errors"]:
         _finding(findings, "medium", "collection", err["section"], "Section could not be collected", err["error"])
+    if data.get("unavailable"):
+        _finding(findings, "info", "collection", ", ".join(data["unavailable"]),
+                 "Not checked: the REST API has no operational data (connectivity, HA, sync, jobs, logs)",
+                 "These need XML API access (API_MODE=xml)")
 
     findings.sort(key=lambda f: SEVERITY_ORDER[f["severity"]])
     return findings
@@ -954,7 +1141,10 @@ def csv_tables(data, findings):
     }
     if data["resources"]:
         tables["firewall_resources.csv"] = (data["resources"], RESOURCE_COLS)
-    return tables
+    csv_section = {"panorama.csv": "panorama", "sync_status.csv": "sync", "jobs.csv": "jobs",
+                   "log_collectors.csv": "collectors", "system_logs.csv": "logs", "config_logs.csv": "logs"}
+    unavailable = set(data.get("unavailable", []))
+    return {name: t for name, t in tables.items() if csv_section.get(name) not in unavailable}
 
 
 def _table(rows, cols, empty="No data collected."):
@@ -1002,12 +1192,12 @@ details summary { cursor:pointer; color:var(--muted); margin-top:8px; }
 
 def write_html(path, data, findings, settings, calls, started):
     devices = data["devices"]
-    connected = sum(1 for d in devices if d.get("connected") == "yes")
     sev = Counter(f["severity"] for f in findings)
-    tiles = [
-        (len(devices), "managed firewalls"),
-        (connected, "connected"),
-        (len(devices) - connected, "not connected"),
+    tiles = [(len(devices), "managed firewalls")]
+    if any("connected" in d for d in devices):
+        connected = sum(1 for d in devices if d.get("connected") == "yes")
+        tiles += [(connected, "connected"), (len(devices) - connected, "not connected")]
+    tiles += [
         (sev["critical"], "critical findings"),
         (sev["high"], "high findings"),
         (sev["medium"], "medium findings"),
@@ -1027,7 +1217,9 @@ def write_html(path, data, findings, settings, calls, started):
                       {"field": "HA peer connection", "value": _ends(ha, "peer-info/conn-status")}]
 
     status_cols = sorted({k for d in devices for k in d if "policy-status" in k or "template-status" in k})
-    inv_cols = columns_for(devices, INVENTORY_COLS[:16] + status_cols, include_extra=False)
+    inv_cols = columns_for(devices, INVENTORY_COLS[:2] + ["device-group", "template-stack"]
+                           + INVENTORY_COLS[2:16] + status_cols, include_extra=False)
+    unavailable = set(data.get("unavailable", []))
 
     rule_summary = Counter((r["location"], r["rulebase"]) for r in data["rules"])
     rule_summary_rows = [{"location": loc, "rulebase": rb, "rules": n,
@@ -1035,22 +1227,33 @@ def write_html(path, data, findings, settings, calls, started):
                                           and r["rulebase"] == rb and r["disabled"] == "yes")}
                          for (loc, rb), n in sorted(rule_summary.items())]
 
-    sections = [
-        ("findings", "Health findings", _table(findings, FINDING_COLS, "No findings.")),
-        ("panorama", "Panorama", _table(pano_rows, ["field", "value"])),
-        ("inventory", "Firewall inventory & connectivity", _table(devices, inv_cols)),
-        ("sync", "Device-group & template sync", _table(data["sync"], columns_for(data["sync"], SYNC_COLS))),
+    inventory_title = ("Firewall inventory (device-group / template-stack membership)"
+                       if settings.api_mode == "rest" else "Firewall inventory & connectivity")
+    # (html id, title, content, SECTIONS name it depends on)
+    candidates = [
+        ("findings", "Health findings", _table(findings, FINDING_COLS, "No findings."), None),
+        ("panorama", "Panorama", _table(pano_rows, ["field", "value"]), "panorama"),
+        ("inventory", inventory_title, _table(devices, inv_cols), "devices"),
+        ("sync", "Device-group & template sync", _table(data["sync"], columns_for(data["sync"], SYNC_COLS)), "sync"),
         ("jobs", f"Recent Panorama jobs (last {settings.max_jobs})",
-         _table(data["jobs"], columns_for(data["jobs"], JOB_COLS[:12], include_extra=False))),
+         _table(data["jobs"], columns_for(data["jobs"], JOB_COLS[:12], include_extra=False)), "jobs"),
         ("collectors", "Log collectors", _table(data["log_collectors"],
-                                                columns_for(data["log_collectors"], ["serial", "host-name", "connected"]))),
+                                                columns_for(data["log_collectors"], ["serial", "host-name", "connected"])),
+         "collectors"),
         ("rules", "Security rules", _table(rule_summary_rows, ["location", "rulebase", "rules", "disabled"])
-         + "<h3>Rule findings</h3>" + _table(rule_findings(data["rules"]), RULE_FINDING_COLS, "No rule findings.")),
+         + "<h3>Rule findings</h3>" + _table(rule_findings(data["rules"]), RULE_FINDING_COLS, "No rule findings."),
+         "rules"),
         ("syslogs", f"System logs, severity high+ (last {settings.log_window_hours}h)",
-         _table(data["system_logs"], columns_for(data["system_logs"], SYSLOG_COLS, include_extra=False))),
+         _table(data["system_logs"], columns_for(data["system_logs"], SYSLOG_COLS, include_extra=False)), "logs"),
         ("configlogs", f"Configuration logs (last {settings.log_window_hours}h)",
-         _table(data["config_logs"], columns_for(data["config_logs"], CONFIGLOG_COLS, include_extra=False))),
+         _table(data["config_logs"], columns_for(data["config_logs"], CONFIGLOG_COLS, include_extra=False)), "logs"),
     ]
+    sections = [(sid, title, content) for sid, title, content, needs in candidates if needs not in unavailable]
+    if unavailable:
+        items = "".join(f"<li>{html.escape(n)}</li>" for n in SECTIONS if n in unavailable)
+        sections.append(("not-collected", "Not collected",
+                         "<p>The REST API has no endpoints for these sections; they need XML API access "
+                         f"(API_MODE=xml):</p><ul>{items}</ul>"))
     if data["resources"]:
         sections.append(("resources", "Per-firewall live status (management plane)",
                          _table(data["resources"], columns_for(data["resources"], RESOURCE_COLS))))
@@ -1069,7 +1272,7 @@ def write_html(path, data, findings, settings, calls, started):
 <body><main>
 <h1>Panorama Health Check</h1>
 <div class="meta">Panorama {html.escape(settings.host)} &middot; collected {started:%Y-%m-%d %H:%M:%S}
- &middot; {len(calls)} read-only API calls</div>
+ &middot; {settings.api_mode.upper()} API &middot; {len(calls)} read-only API calls</div>
 <nav>{nav}</nav>
 <div class="tiles">{tiles_html}</div>
 {body}
@@ -1082,9 +1285,49 @@ def write_html(path, data, findings, settings, calls, started):
 # Diagnose
 # --------------------------------------------------------------------------
 
+REST_CHECKS = [
+    ("Objects/Addresses (shared): your known-working call", "Objects/Addresses", {"location": "shared"}),
+    ("Policies/SecurityPreRules (shared)", "Policies/SecurityPreRules", {"location": "shared"}),
+    ("Policies/SecurityPostRules (shared)", "Policies/SecurityPostRules", {"location": "shared"}),
+]
+
+
 def diagnose(client):
-    print(f"Diagnosing API access to {client.settings.host} (read-only checks)")
+    print(f"Diagnosing {client.settings.api_mode.upper()} API access to {client.settings.host} (read-only checks)")
     print(f"Using {client.settings.key_label()}\n")
+    if client.settings.api_mode == "rest":
+        return diagnose_rest(client)
+    return diagnose_xml(client)
+
+
+def diagnose_rest(client):
+    ok = True
+    for label, endpoint, query in REST_CHECKS:
+        try:
+            entries = client.rest_get(endpoint, query)
+            print(f"  PASS  {label} ({len(entries)} entries)")
+        except ApiError as exc:
+            ok = False
+            print(f"  FAIL  {label}\n        {exc}")
+
+    collector = Collector(client, client.settings)
+    try:
+        with_query = collector._rest_device_groups()
+        names = ", ".join(e.get("@name", "") for e in with_query) or "none"
+        print(f"  PASS  Panorama/DeviceGroups ({len(with_query)}: {names})")
+        stacks = client.rest_get("Panorama/TemplateStacks", collector._panorama_query)
+        print(f"  PASS  Panorama/TemplateStacks ({len(stacks)} entries)")
+    except ApiError as exc:
+        ok = False
+        print(f"  FAIL  Panorama/DeviceGroups or TemplateStacks\n        {exc}")
+
+    print("\nThe REST API covers configuration only: inventory by device group, and security rules.")
+    print("Connectivity, HA, sync, jobs and logs are not available through REST.")
+    print("\nAll checks passed." if ok else "\nSome checks failed; the report will include what passed.")
+    return 0 if ok else 1
+
+
+def diagnose_xml(client):
     checks = [
         ("Operational request: show system info", lambda: client.op("system_info")),
         ("Operational request: show devices all", lambda: client.op("devices_all")),
@@ -1115,7 +1358,6 @@ KEY_METHODS = [
     ("X-PAN-KEY header, POST", {"key_in_header": True, "http_method": "POST"}),
     ("X-PAN-KEY header, GET", {"key_in_header": True, "http_method": "GET"}),
     ("key in POST body", {"key_in_header": False, "http_method": "POST"}),
-    ("key in URL query, GET (typical curl)", {"key_in_header": False, "http_method": "GET"}),
 ]
 
 
@@ -1145,10 +1387,9 @@ def compare_key_methods(client):
         print("\n  -> Panorama accepts the key another way. Set these in .env and run --diagnose again:")
         print(f"       KEY_IN_HEADER={'true' if best['key_in_header'] else 'false'}")
         print(f"       HTTP_METHOD={best['http_method']}")
-    elif not working:
-        print("\n  -> Every method was denied, so this is not about how the key is sent.")
-        print(f"     Check that the key in .env (ending ...{client.settings.api_key[-4:]}) is exactly the one your")
-        print("     working curl uses, and that the curl is aimed at the same Panorama.")
+    else:
+        print("\n  -> Every method was denied: the role has no XML API access. If your key works with")
+        print("     the REST API (/restapi/...), set API_MODE=rest in .env.")
 
 
 # --------------------------------------------------------------------------

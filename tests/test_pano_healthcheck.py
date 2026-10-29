@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -94,15 +95,54 @@ SESSION_INFO = """<response status="success"><result><num-max>100000</num-max><n
 <cps>120</cps></result></response>"""
 
 
+REST_DEVICE_GROUPS = {"@status": "success", "@code": "19", "result": {"@count": "1", "entry": [
+    {"@name": "DG-Branch", "devices": {"entry": [{"@name": "001"}, {"@name": "002"}]}}]}}
+
+REST_TEMPLATE_STACKS = {"@status": "success", "result": {"entry": [
+    {"@name": "TS-Branch", "devices": {"entry": [{"@name": "001"}]}}]}}
+
+REST_PRE_RULES_DG = {"@status": "success", "@code": "19", "result": {"@count": "2", "entry": [
+    {"@name": "allow-any", "@uuid": "u1", "@location": "device-group", "@device-group": "DG-Branch",
+     "from": {"member": ["any"]}, "to": {"member": ["any"]}, "source": {"member": ["any"]},
+     "destination": {"member": ["any"]}, "application": {"member": ["any"]}, "service": {"member": ["any"]},
+     "action": "allow"},
+    {"@name": "web-out", "@uuid": "u2", "@location": "device-group", "@device-group": "DG-Branch",
+     "from": {"member": ["trust"]}, "to": {"member": ["untrust"]}, "source": {"member": ["10.0.0.0/8"]},
+     "destination": {"member": ["any"]}, "application": {"member": ["web-browsing"]},
+     "service": {"member": ["application-default"]}, "action": "allow",
+     "profile-setting": {"group": {"member": ["default"]}}, "log-setting": "to-panorama"},
+]}}
+
+REST_EMPTY = {"@status": "success", "@code": "19", "result": {"@count": "0", "@total-count": "0"}}
+REST_DENIED = {"code": 16, "message": "Unauthorized request"}
+
+
 class FakePanorama:
     """Transport stand-in: answers by request parameters, records what was sent."""
 
     def __init__(self):
         self.sent = []
 
-    def __call__(self, body, headers, method="POST"):
-        params = dict(urllib.parse.parse_qsl(body.decode()))
+    def __call__(self, path, query, headers, method="POST"):
+        params = dict(urllib.parse.parse_qsl(query))
         self.sent.append((params, headers))
+        if path.startswith("/restapi/"):
+            assert method == "GET", "REST calls must be GET"
+            return self.rest(path.split("/", 3)[3], params)
+        return 200, self.xml(params)
+
+    def rest(self, endpoint, params):
+        if endpoint == "Panorama/DeviceGroups":
+            doc = REST_DEVICE_GROUPS
+        elif endpoint == "Panorama/TemplateStacks":
+            doc = REST_TEMPLATE_STACKS
+        elif endpoint == "Policies/SecurityPreRules" and params.get("device-group") == "DG-Branch":
+            doc = REST_PRE_RULES_DG
+        else:
+            doc = REST_EMPTY
+        return 200, json.dumps(doc).encode()
+
+    def xml(self, params):
         t = params["type"]
         if t == "op":
             name = next(k for k, v in ph.OP_COMMANDS.items() if v == params["cmd"])
@@ -197,7 +237,28 @@ class GuardTests(unittest.TestCase):
         client = ph.PanoramaClient(make_settings(), transport=fake, log=lambda *_: None)
         with self.assertRaises(ph.ReadOnlyViolation):
             client.request({"type": "config", "action": "delete", "xpath": "/config/shared"}, "bad")
+        with self.assertRaises(ph.ReadOnlyViolation):
+            client.rest_get("Objects/Tags", {"location": "shared"})
         self.assertEqual(fake.sent, [])
+
+    def test_rest_guard(self):
+        ph.guard_rest("GET", "Policies/SecurityPreRules", {"location": "shared"})
+        ph.guard_rest("GET", "Policies/SecurityPreRules", {"location": "device-group", "device-group": "DG 1"})
+        ph.guard_rest("GET", "Panorama/DeviceGroups", {})
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            with self.assertRaises(ph.ReadOnlyViolation, msg=method):
+                ph.guard_rest(method, "Objects/Addresses", {"location": "shared"})
+        for endpoint, query in (
+            ("Objects/Tags", {"location": "shared"}),                         # not allowlisted
+            ("Objects/Addresses", {"location": "shared", "name": "x"}),       # extra parameter
+            ("Objects/Addresses", {"location": "shared", "newname": "y"}),    # rename parameter
+            ("Objects/Addresses", {"location": "vsys"}),                      # unknown location
+            ("Policies/SecurityPreRules", {"location": "device-group"}),      # missing device-group
+            ("Policies/SecurityPreRules", {"location": "shared", "device-group": "DG"}),
+            ("Policies/SecurityPreRules", {"location": "device-group", "device-group": "a\nb"}),
+        ):
+            with self.assertRaises(ph.ReadOnlyViolation, msg=(endpoint, query)):
+                ph.guard_rest("GET", endpoint, query)
 
 
 class SettingsTests(unittest.TestCase):
@@ -224,6 +285,17 @@ class SettingsTests(unittest.TestCase):
             ph.load_settings(path, environ={})
         self.assertEqual(ph.load_settings(path, environ={}, require_key=False).host, "192.0.2.10")
 
+    def test_key_never_allowed_in_url(self):
+        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=k\n"
+                         "HTTP_METHOD=GET\nKEY_IN_HEADER=false\n")
+        with self.assertRaises(ph.ConfigError):
+            ph.load_settings(path, environ={})
+
+    def test_rest_is_default_mode(self):
+        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=k\n")
+        settings = ph.load_settings(path, environ={})
+        self.assertEqual((settings.api_mode, settings.rest_version), ("rest", "v11.0"))
+
 
 class ClientTests(unittest.TestCase):
     def test_key_goes_in_header_not_body(self):
@@ -236,7 +308,8 @@ class ClientTests(unittest.TestCase):
 
     def test_error_response_maps_code_and_hint(self):
         denied = b'<response status="error" code="16"><msg><line>Unauthorized request</line></msg></response>'
-        client = ph.PanoramaClient(make_settings(), transport=lambda b, h, m: denied, log=lambda *_: None)
+        client = ph.PanoramaClient(make_settings(), transport=lambda p, q, h, m: (200, denied),
+                                   log=lambda *_: None)
         with self.assertRaises(ph.ApiError) as ctx:
             client.op("devices_all")
         self.assertEqual(ctx.exception.code, "16")
@@ -247,33 +320,41 @@ class ClientTests(unittest.TestCase):
                          b'for user role.</msg></result></response>')
         fake = FakePanorama()
 
-        def header_denied(body, headers, method="POST"):
-            if "X-PAN-KEY" in headers or method == "POST":
-                return config_denied
-            return fake(body, headers, method)
+        def header_denied(path, query, headers, method="POST"):
+            if "X-PAN-KEY" in headers:
+                return 403, config_denied
+            return fake(path, query, headers, method)
 
         client = ph.PanoramaClient(make_settings(), transport=header_denied, log=lambda *_: None)
         with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(ph.time, "sleep"):
             code = ph.diagnose(client)
         self.assertEqual(code, 1)
-        self.assertIn("PASS  key in URL query, GET", out.getvalue())
+        self.assertIn("PASS  key in POST body", out.getvalue())
         self.assertIn("KEY_IN_HEADER=false", out.getvalue())
-        self.assertIn("HTTP_METHOD=GET", out.getvalue())
-
-    def test_get_sends_key_only_in_query(self):
-        fake = FakePanorama()
-        client = ph.PanoramaClient(make_settings(key_in_header=False, http_method="GET"), transport=fake,
-                                   log=lambda *_: None)
-        client.op("system_info")
-        params, headers = fake.sent[0]
-        self.assertEqual(params["key"], "SECRET-KEY")
-        self.assertNotIn("X-PAN-KEY", headers)
 
     def test_non_xml_response_is_reported(self):
-        client = ph.PanoramaClient(make_settings(), transport=lambda b, h, m: b"<html>proxy</html>x",
+        client = ph.PanoramaClient(make_settings(), transport=lambda p, q, h, m: (200, b"<html>proxy</html>x"),
                                    log=lambda *_: None)
         with self.assertRaises(ph.ApiError):
             client.op("system_info")
+
+    def test_rest_get_sends_key_in_header_only(self):
+        fake = FakePanorama()
+        client = ph.PanoramaClient(make_settings(api_mode="rest"), transport=fake, log=lambda *_: None)
+        entries = client.rest_get("Panorama/DeviceGroups", {"location": "panorama"})
+        params, headers = fake.sent[0]
+        self.assertEqual(entries[0]["@name"], "DG-Branch")
+        self.assertEqual(headers["X-PAN-KEY"], "SECRET-KEY")
+        self.assertEqual(params, {"location": "panorama"})
+
+    def test_rest_permission_error_has_hint(self):
+        client = ph.PanoramaClient(make_settings(api_mode="rest"),
+                                   transport=lambda p, q, h, m: (403, json.dumps(REST_DENIED).encode()),
+                                   log=lambda *_: None)
+        with self.assertRaises(ph.ApiError) as ctx:
+            client.rest_get("Policies/SecurityPreRules", {"location": "shared"})
+        self.assertEqual(ctx.exception.code, "403")
+        self.assertIn("REST API tab > Policies > SecurityPreRules", str(ctx.exception))
 
 
 class ParserTests(unittest.TestCase):
@@ -301,13 +382,13 @@ class ParserTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
-    def run_main(self, *args):
+    def run_main(self, *args, mode="xml"):
         fake = FakePanorama()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         env = Path(tmp.name) / ".env"
         env.write_text(f"PANORAMA_HOST={LAB_HOST}\nALLOWED_HOSTS={LAB_HOST}\nPANORAMA_API_KEY=SECRET-KEY\n"
-                       "REQUEST_DELAY_SEC=0\n", encoding="utf-8")
+                       f"REQUEST_DELAY_SEC=0\nAPI_MODE={mode}\n", encoding="utf-8")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(ph.time, "sleep"):  # skip log-poll waits
             code = ph.main(["--env", str(env), "--output-dir", tmp.name, *args], transport=fake)
@@ -334,14 +415,45 @@ class EndToEndTests(unittest.TestCase):
         for params, _ in fake.sent:
             self.assertIn(params["type"], ("op", "config", "log"))
 
+    def test_rest_run_writes_rules_and_inventory(self):
+        code, fake, out_dir, stdout = self.run_main(mode="rest")
+        self.assertEqual(code, 0, stdout)
+        report_dir = next(p for p in out_dir.iterdir() if p.is_dir())
+        names = {p.name for p in report_dir.iterdir()}
+        self.assertTrue({"report.html", "inventory.csv", "security_rules.csv", "rule_findings.csv",
+                         "findings.csv"} <= names)
+        self.assertNotIn("jobs.csv", names)  # not available through REST
+
+        inventory = (report_dir / "inventory.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("001,DG-Branch,TS-Branch", inventory)
+        rules = (report_dir / "security_rules.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("allow-any", rules)
+        self.assertIn("web-out", rules)
+        findings = (report_dir / "findings.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("all 'any'", findings)
+        self.assertNotIn("not connected", findings)  # REST has no connectivity data; no false alarms
+
+        html_text = (report_dir / "report.html").read_text(encoding="utf-8")
+        self.assertIn("Not collected", html_text)
+        self.assertNotIn("SECRET-KEY", html_text)
+        self.assertTrue(all(h.get("X-PAN-KEY") == "SECRET-KEY" for _, h in fake.sent))
+
+    def test_rest_diagnose(self):
+        fake = FakePanorama()
+        client = ph.PanoramaClient(make_settings(api_mode="rest"), transport=fake, log=lambda *_: None)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = ph.diagnose(client)
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("PASS  Panorama/DeviceGroups (1: DG-Branch)", out.getvalue())
+
     def test_rules_collected_when_op_is_denied(self):
         fake = FakePanorama()
 
-        def op_denied(body, headers, method="POST"):
-            if b"type=op" in body:
-                fake.sent.append((dict(urllib.parse.parse_qsl(body.decode())), headers))
-                return OP_DENIED.encode()
-            return fake(body, headers)
+        def op_denied(path, query, headers, method="POST"):
+            if "type=op" in query:
+                fake.sent.append((dict(urllib.parse.parse_qsl(query)), headers))
+                return 403, OP_DENIED.encode()
+            return fake(path, query, headers, method)
 
         client = ph.PanoramaClient(make_settings(), transport=op_denied, log=lambda *_: None)
         with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(ph.time, "sleep"):

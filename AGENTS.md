@@ -11,12 +11,13 @@ This repo is a **read-only** Palo Alto Panorama health-check collector. It is us
    - `user-id`
    - op `<request>`, `<clear>`, `<set>`, `<debug>`, `<test>` or `<commit-all>`
    - anything that creates, deletes or modifies objects
-2. **All requests go through `PanoramaClient.request()` and therefore through `guard()`.**
+2. **All requests go through the guarded client methods.**
+   - XML requests go through `PanoramaClient.request()`, which calls `guard()`. REST requests go through `PanoramaClient.rest_get()`, which calls `guard_rest()`.
    - Never call urllib or HTTP directly anywhere else.
-   - Never weaken `guard()`.
-   - To add a new command, add the exact XML to `OP_COMMANDS`. Only `<show>` commands are allowed.
-   - Add a test for the new command in `tests/test_pano_healthcheck.py`.
-   - `cmd` must never be built from user input or free-form strings.
+   - Never weaken either guard.
+   - To add an XML command, add the exact XML to `OP_COMMANDS`. Only `<show>` commands are allowed. `cmd` must never be built from user input or free-form strings.
+   - To add a REST endpoint, add it to `REST_ENDPOINTS`. REST is `GET` only: never POST, PUT or DELETE, and never rename, move or edit parameters.
+   - Add a test for every new command or endpoint in `tests/test_pano_healthcheck.py`.
 3. **Lab only.**
    - Do not change `ALLOWED_HOSTS` handling. It is read from `.env` only, never from environment variables.
    - Do not add production hosts.
@@ -24,7 +25,7 @@ This repo is a **read-only** Palo Alto Panorama health-check collector. It is us
 4. **Secrets.**
    - Never print, log, write to reports or commit the API key.
    - `.env` is git-ignored; keep it that way.
-   - The key goes in the `X-PAN-KEY` header, or in the POST body. Never put it in URLs.
+   - The key goes in the `X-PAN-KEY` header, or in the POST body (XML only). Never put it in URLs; `load_settings()` rejects `HTTP_METHOD=GET` with `KEY_IN_HEADER=false`.
 5. **Low load.**
    - Requests run one at a time with `REQUEST_DELAY_SEC` between them. Do not add threads or parallel requests.
    - Prefer one Panorama-wide aggregate call, such as `show devices all`, over per-firewall calls.
@@ -37,11 +38,22 @@ This repo is a **read-only** Palo Alto Panorama health-check collector. It is us
 
 The whole tool is one file, `pano_healthcheck.py`. Its sections, in order:
 
-- **Settings:** `.env` loader and `load_settings()`, which applies the lab-host lock.
-- **Guard:** `OP_COMMANDS` (the allowlist), `guard()` and `ReadOnlyViolation`.
-- **API client:** `PanoramaClient`, which handles TLS, proxy bypass, throttling, error-code mapping and the log-job polling.
-- **XML helpers:** `flatten()` turns PAN-OS XML into `{path: text}`; `top_entries()`.
-- **Collectors:** a `Collector.collect_<section>()` method for each section in `SECTIONS`. A section that fails is recorded in `data["errors"]` and the run continues.
+- **Settings:** `.env` loader and `load_settings()`, which applies the lab-host lock and reads `API_MODE` (`rest`, the default, or `xml`).
+- **Guards:**
+  - XML: `OP_COMMANDS` (the allowlist), `guard()`.
+  - REST: `REST_ENDPOINTS` (the allowlist), `guard_rest()`.
+  - Both raise `ReadOnlyViolation`.
+- **API client:** `PanoramaClient`.
+  - `_send()` handles throttling and the single retry.
+  - `request()` sends XML requests; `rest_get()` sends REST requests.
+  - It also handles TLS, proxy bypass, error-code mapping and the log-job polling.
+- **XML helpers:**
+  - `flatten()` turns PAN-OS XML into `{path: text}`.
+  - `json_to_element()` turns REST JSON into the same XML shape, so the parsers and health rules are shared.
+  - `top_entries()`.
+- **Collectors:** `Collector.collect_<section>()` for XML mode and `collect_<section>_rest()` for REST mode, one per section in `SECTIONS`.
+  - A section with no REST method is listed in `data["unavailable"]`.
+  - A section that fails is recorded in `data["errors"]`, and the run continues.
 - **Health findings:** `evaluate()` (device, sync, job and resource rules) and `evaluate_rule()` (security-rule checks).
 - **Reports:** CSV via `write_csv()`/`csv_tables()`, and a self-contained HTML page via `write_html()`.
 - **CLI:** `main()` with `--diagnose`, `--dry-run`, `--sections`, `--targeted` and `--format`.
