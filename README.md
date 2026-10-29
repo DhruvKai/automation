@@ -169,6 +169,7 @@ If one section fails, for example because the role is missing a permission, the 
 | Code | Meaning | Usual fix |
 |---|---|---|
 | 403 "Type [op] not authorized for user role" | The key is **valid**, but its admin role doesn't allow operational commands. Config queries can still work, because each XML API permission is separate | On Panorama: **Panorama > Admin Roles > *role* > XML API**, enable **Operational Requests** (and **Log**), then **Commit to Panorama**. If you aren't a Panorama admin, ask one to do this |
+| 403 on **every** check, although the same key works in curl | Panorama may be treating the key differently depending on how it is sent. `--diagnose` then repeats one config read in each of 4 ways of sending the key and prints the `.env` settings for the way that works | Set `KEY_IN_HEADER` and `HTTP_METHOD` as printed. `KEY_IN_HEADER=false` with `HTTP_METHOD=GET` matches a typical curl, but puts the key in the URL, where Panorama's web server logs can record it. If every way fails, the key in `.env` is not the one your curl uses |
 | 16 / 403 (other) | Not authorised | Enable the matching **XML API** permission on the admin role (Operational Requests, Configuration or Log), or check the key |
 | 17 / 18 / 1 | Invalid, malformed or unknown command | The command is not valid on this PAN-OS version |
 | 22 | Session timed out | Generate a new key |

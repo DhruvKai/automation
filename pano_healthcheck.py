@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -48,6 +48,7 @@ DEFAULTS = {
     "CA_BUNDLE": "",
     "BYPASS_PROXY": "true",
     "KEY_IN_HEADER": "true",
+    "HTTP_METHOD": "POST",
     "REQUEST_DELAY_SEC": "1",
     "TIMEOUT_SEC": "60",
     "LOG_WINDOW_HOURS": "24",
@@ -86,12 +87,15 @@ class Settings:
     max_targeted: int
     output_dir: Path
     key_source: str = ""
+    http_method: str = "POST"
 
     def key_label(self):
         """Masked key description, for comparing with the key used in curl."""
         if not self.api_key:
             return "no API key"
-        return f"API key ...{self.api_key[-4:]} ({len(self.api_key)} chars, from {self.key_source})"
+        sent = "X-PAN-KEY header" if self.key_in_header else ("URL query" if self.http_method == "GET" else "POST body")
+        return (f"API key ...{self.api_key[-4:]} ({len(self.api_key)} chars, from {self.key_source}), "
+                f"sent via {self.http_method} in {sent}")
 
 
 def load_env_file(path):
@@ -138,6 +142,10 @@ def load_settings(env_path, environ=None, require_key=True):
     if require_key and not values["PANORAMA_API_KEY"].strip():
         raise ConfigError("PANORAMA_API_KEY is empty. Put the lab API key in .env.")
 
+    http_method = values["HTTP_METHOD"].strip().upper()
+    if http_method not in ("POST", "GET"):
+        raise ConfigError("HTTP_METHOD must be POST or GET")
+
     output_dir = Path(values["OUTPUT_DIR"])
     if not output_dir.is_absolute():
         output_dir = SCRIPT_DIR / output_dir
@@ -161,6 +169,7 @@ def load_settings(env_path, environ=None, require_key=True):
             max_targeted=int(values["MAX_TARGETED_FIREWALLS"]),
             output_dir=output_dir,
             key_source=key_source,
+            http_method=http_method,
         )
     except ValueError as exc:
         raise ConfigError(f"Invalid number in .env: {exc}") from None
@@ -275,10 +284,12 @@ def error_hint(code, req_type, message=""):
     perm = ROLE_PERMISSION.get(req_type, "the matching")
     if code in ("16", "403"):
         if "not authorized for user role" in message:
-            return (f"The key is valid, but its admin role does not allow '{perm}'. On Panorama: "
+            hint = (f"The key is valid, but its admin role does not allow '{perm}'. On Panorama: "
                     f"Panorama > Admin Roles > <role> > XML API tab > enable '{perm}', then commit "
-                    "on Panorama. Each XML API permission is separate, so config queries can work "
-                    "while this one is denied.")
+                    "on Panorama.")
+            if req_type != "config":
+                hint += " Each XML API permission is separate, so config queries can work while this one is denied."
+            return hint
         return (f"Check the API key, and that its admin role has XML API > '{perm}' enabled "
                 "(Panorama > Admin Roles).")
     if code in ("1", "17", "18"):
@@ -343,8 +354,11 @@ class PanoramaClient:
         opener = urllib.request.build_opener(*handlers)
         url = f"https://{s.host}:{s.port}/api/"
 
-        def send(body, headers):
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        def send(body, headers, method="POST"):
+            if method == "GET":
+                req = urllib.request.Request(f"{url}?{body.decode()}", headers=headers, method="GET")
+            else:
+                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             try:
                 with opener.open(req, timeout=s.timeout) as resp:
                     return resp.read()
@@ -369,7 +383,8 @@ class PanoramaClient:
             time.sleep(wait)
 
         body_params = dict(params)
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        method = self.settings.http_method
+        headers = {"Content-Type": "application/x-www-form-urlencoded"} if method == "POST" else {}
         if self.settings.key_in_header:
             headers["X-PAN-KEY"] = self.settings.api_key
         else:
@@ -379,7 +394,7 @@ class PanoramaClient:
         payload = None
         for attempt in (1, 2):
             try:
-                payload = self._transport(body, headers)
+                payload = self._transport(body, headers, method)
                 break
             except HttpStatusError as exc:
                 raise ApiError(f"HTTP {exc.status} {exc.reason}", code=str(exc.status),
@@ -1078,6 +1093,7 @@ def diagnose(client):
         ("Log read: 1 system log", lambda: client.log_query("system", "", 1)),
     ]
     ok = True
+    denied = False
     for label, call in checks:
         try:
             result = call()
@@ -1087,9 +1103,52 @@ def diagnose(client):
             print(f"  PASS  {label}{extra}")
         except ApiError as exc:
             ok = False
+            denied = denied or exc.code in ("16", "403")
             print(f"  FAIL  {label}\n        {exc}")
+    if denied:
+        compare_key_methods(client)
     print("\nAll checks passed." if ok else "\nSome checks failed; see the hints above.")
     return 0 if ok else 1
+
+
+KEY_METHODS = [
+    ("X-PAN-KEY header, POST", {"key_in_header": True, "http_method": "POST"}),
+    ("X-PAN-KEY header, GET", {"key_in_header": True, "http_method": "GET"}),
+    ("key in POST body", {"key_in_header": False, "http_method": "POST"}),
+    ("key in URL query, GET (typical curl)", {"key_in_header": False, "http_method": "GET"}),
+]
+
+
+def compare_key_methods(client):
+    """Repeat one small config read with each way of sending the key."""
+    print("\nAccess was denied. Trying the same config read with each way of sending the key:")
+    xpath = f"{PANORAMA_DEVICE_XPATH}/deviceconfig/system/hostname"
+    working = []
+    for label, changes in KEY_METHODS:
+        probe = PanoramaClient(replace(client.settings, **changes), transport=client._transport, log=client.log)
+        try:
+            probe.config_show(xpath)
+            accepted = True
+        except ApiError as exc:
+            accepted = exc.code not in ("16", "403")  # any other error means the key got through
+            if not accepted:
+                print(f"  FAIL  {label}: code {exc.code}")
+        if accepted:
+            working.append(changes)
+            print(f"  PASS  {label}")
+        client.calls += probe.calls
+    current = {"key_in_header": client.settings.key_in_header, "http_method": client.settings.http_method}
+    if current in working:
+        print("\n  -> The current method works for config reads; the failures above are role permissions.")
+    elif working:
+        best = working[0]
+        print("\n  -> Panorama accepts the key another way. Set these in .env and run --diagnose again:")
+        print(f"       KEY_IN_HEADER={'true' if best['key_in_header'] else 'false'}")
+        print(f"       HTTP_METHOD={best['http_method']}")
+    elif not working:
+        print("\n  -> Every method was denied, so this is not about how the key is sent.")
+        print(f"     Check that the key in .env (ending ...{client.settings.api_key[-4:]}) is exactly the one your")
+        print("     working curl uses, and that the curl is aimed at the same Panorama.")
 
 
 # --------------------------------------------------------------------------

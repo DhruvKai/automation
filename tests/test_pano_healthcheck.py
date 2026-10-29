@@ -100,7 +100,7 @@ class FakePanorama:
     def __init__(self):
         self.sent = []
 
-    def __call__(self, body, headers):
+    def __call__(self, body, headers, method="POST"):
         params = dict(urllib.parse.parse_qsl(body.decode()))
         self.sent.append((params, headers))
         t = params["type"]
@@ -236,14 +236,41 @@ class ClientTests(unittest.TestCase):
 
     def test_error_response_maps_code_and_hint(self):
         denied = b'<response status="error" code="16"><msg><line>Unauthorized request</line></msg></response>'
-        client = ph.PanoramaClient(make_settings(), transport=lambda b, h: denied, log=lambda *_: None)
+        client = ph.PanoramaClient(make_settings(), transport=lambda b, h, m: denied, log=lambda *_: None)
         with self.assertRaises(ph.ApiError) as ctx:
             client.op("devices_all")
         self.assertEqual(ctx.exception.code, "16")
         self.assertIn("Operational Requests", str(ctx.exception))
 
+    def test_diagnose_finds_working_key_method(self):
+        config_denied = (b'<response status="error" code="403"><result><msg>Type [config] not authorized '
+                         b'for user role.</msg></result></response>')
+        fake = FakePanorama()
+
+        def header_denied(body, headers, method="POST"):
+            if "X-PAN-KEY" in headers or method == "POST":
+                return config_denied
+            return fake(body, headers, method)
+
+        client = ph.PanoramaClient(make_settings(), transport=header_denied, log=lambda *_: None)
+        with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(ph.time, "sleep"):
+            code = ph.diagnose(client)
+        self.assertEqual(code, 1)
+        self.assertIn("PASS  key in URL query, GET", out.getvalue())
+        self.assertIn("KEY_IN_HEADER=false", out.getvalue())
+        self.assertIn("HTTP_METHOD=GET", out.getvalue())
+
+    def test_get_sends_key_only_in_query(self):
+        fake = FakePanorama()
+        client = ph.PanoramaClient(make_settings(key_in_header=False, http_method="GET"), transport=fake,
+                                   log=lambda *_: None)
+        client.op("system_info")
+        params, headers = fake.sent[0]
+        self.assertEqual(params["key"], "SECRET-KEY")
+        self.assertNotIn("X-PAN-KEY", headers)
+
     def test_non_xml_response_is_reported(self):
-        client = ph.PanoramaClient(make_settings(), transport=lambda b, h: b"<html>proxy</html>x",
+        client = ph.PanoramaClient(make_settings(), transport=lambda b, h, m: b"<html>proxy</html>x",
                                    log=lambda *_: None)
         with self.assertRaises(ph.ApiError):
             client.op("system_info")
@@ -310,7 +337,7 @@ class EndToEndTests(unittest.TestCase):
     def test_rules_collected_when_op_is_denied(self):
         fake = FakePanorama()
 
-        def op_denied(body, headers):
+        def op_denied(body, headers, method="POST"):
             if b"type=op" in body:
                 fake.sent.append((dict(urllib.parse.parse_qsl(body.decode())), headers))
                 return OP_DENIED.encode()
