@@ -26,25 +26,118 @@ This command-line tool collects firewall health data from **Panorama** through t
 
 The default run (without `--targeted`) makes about 10 calls, plus 2 per device group. Calls go out one at a time with `REQUEST_DELAY_SEC` between them.
 
-## Setup
+## How to run (step by step)
 
-1. Create an admin role on the **lab** Panorama: **Panorama > Admin Roles > XML API**.
-   - Enable **Operational Requests**, **Configuration** and **Log**.
-   - Disable everything else: Commit, Import, Export, User-ID Agent, Report and so on.
-   - Disable the Web UI and REST API tabs too if the account is for automation only.
-2. Generate an API key for an admin that uses this role.
-3. Put the key in `.env` as `PANORAMA_API_KEY=...`. `.env` is git-ignored; never commit it.
+### 1. Check that Python is installed
 
-## Run
+Open **PowerShell** or **Command Prompt** and run:
 
 ```
-python pano_healthcheck.py --diagnose     # check access and permissions with 4 small calls
-python pano_healthcheck.py --dry-run      # list the calls that would be made; send nothing
-python pano_healthcheck.py                # full collection, writes HTML and CSV
-python pano_healthcheck.py --format csv   # CSV only
-python pano_healthcheck.py --sections devices,sync,jobs
-python pano_healthcheck.py --targeted     # add per-firewall live checks (up to MAX_TARGETED_FIREWALLS)
+python --version
 ```
+
+You need Python 3.9 or later. If `python` is not found, try `py --version`. If that works, type `py` instead of `python` in every command below. If neither works, ask IT for Python 3. Nothing else needs to be installed.
+
+### 2. Get the files
+
+Pick one:
+
+- With git:
+
+  ```
+  git clone https://github.com/DhruvKai/automation.git
+  cd automation
+  ```
+
+- Without git: on GitHub, click **Code > Download ZIP**, extract it, then open PowerShell in the extracted folder:
+
+  ```
+  cd C:\path\to\automation
+  ```
+
+Run every command below from this folder.
+
+### 3. Create the API admin role and key (one time, lab Panorama)
+
+1. On the **lab** Panorama, go to **Panorama > Admin Roles** and create a role.
+2. On the role's **XML API** tab, enable **Operational Requests**, **Configuration** and **Log**.
+3. Disable everything else on that tab: Commit, Import, Export, User-ID Agent, Report and so on.
+4. If the account is for automation only, disable the Web UI and REST API tabs too.
+5. Create an admin account that uses this role.
+6. Generate an API key for that admin.
+
+### 4. Create `.env`
+
+- **Cloned from git:** `.env` is not in the repo, so copy the example:
+
+  ```
+  copy .env.example .env
+  ```
+
+- **Downloaded the ZIP:** also copy `.env.example` to `.env`.
+
+Open `.env` in Notepad and fill in:
+
+```
+PANORAMA_HOST=10.26.254.218
+ALLOWED_HOSTS=10.26.254.218
+PANORAMA_API_KEY=<paste the key here>
+```
+
+Leave the other settings as they are for the first run. `.env` is git-ignored; never commit it or share it.
+
+### 5. Test access
+
+```
+python pano_healthcheck.py --diagnose
+```
+
+This sends 4 small read-only calls and prints `PASS` or `FAIL` for each. A `FAIL` line includes the error code and which role permission to enable; see [Troubleshooting](#troubleshooting). Fix any failures before going on.
+
+### 6. Preview the calls (optional)
+
+```
+python pano_healthcheck.py --dry-run
+```
+
+This prints every API call a full run would make. It sends nothing to Panorama.
+
+### 7. Run the health check
+
+```
+python pano_healthcheck.py
+```
+
+Progress is printed per section. A full run takes about 1–2 minutes; the log queries are the slowest part. At the end, the script prints the report folder, for example:
+
+```
+Done: 14 read-only API calls, 6 firewalls, 9 findings (critical 1, high 3, medium 5).
+Report: C:\...\automation\reports\20261029-101500
+```
+
+### 8. Open the report
+
+Open the report folder and double-click `report.html` to view it in your browser. Open the CSV files in Excel. To open the newest report from PowerShell:
+
+```
+start (Get-ChildItem reports | Sort-Object Name | Select-Object -Last 1).FullName
+```
+
+### Other options
+
+```
+python pano_healthcheck.py --format csv                 # CSV only, no HTML
+python pano_healthcheck.py --format html                # HTML only
+python pano_healthcheck.py --sections devices,sync,jobs # only some sections
+python pano_healthcheck.py --targeted                   # add live per-firewall checks
+python pano_healthcheck.py --env C:\path\to\other.env   # use a different settings file
+python pano_healthcheck.py --help                       # list all options
+```
+
+- `--sections` choices: `panorama`, `devices`, `sync`, `jobs`, `collectors`, `rules`, `logs`, `targeted`.
+- `--targeted` checks up to `MAX_TARGETED_FIREWALLS` firewalls, with 3 extra calls per firewall.
+
+## Output
 
 Output goes to `reports/<YYYYMMDD-HHMMSS>/`:
 
