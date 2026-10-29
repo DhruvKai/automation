@@ -117,7 +117,7 @@ Leave everything else as it is. `.env` is git-ignored; never commit it or share 
 python pano_healthcheck.py --diagnose
 ```
 
-This sends a few small read-only calls and prints `PASS` or `FAIL` for each, including the call you already know works (`Objects/Addresses`). A `FAIL` line names the exact permission that is missing; see [Troubleshooting](#troubleshooting).
+This sends a few small read-only calls and prints `PASS` or `FAIL` for each. A `FAIL` line names the exact permission that is missing; see [Troubleshooting](#troubleshooting).
 
 ### 6. Preview the calls (optional)
 

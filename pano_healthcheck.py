@@ -275,7 +275,6 @@ def guard(params):
 
 # The only REST endpoints this tool can ever call, and only with GET.
 REST_ENDPOINTS = frozenset({
-    "Objects/Addresses",            # diagnose baseline (the call known to work)
     "Policies/SecurityPreRules",
     "Policies/SecurityPostRules",
     "Panorama/DeviceGroups",
@@ -1286,7 +1285,6 @@ def write_html(path, data, findings, settings, calls, started):
 # --------------------------------------------------------------------------
 
 REST_CHECKS = [
-    ("Objects/Addresses (shared): your known-working call", "Objects/Addresses", {"location": "shared"}),
     ("Policies/SecurityPreRules (shared)", "Policies/SecurityPreRules", {"location": "shared"}),
     ("Policies/SecurityPostRules (shared)", "Policies/SecurityPostRules", {"location": "shared"}),
 ]

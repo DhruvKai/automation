@@ -247,12 +247,12 @@ class GuardTests(unittest.TestCase):
         ph.guard_rest("GET", "Panorama/DeviceGroups", {})
         for method in ("POST", "PUT", "DELETE", "PATCH"):
             with self.assertRaises(ph.ReadOnlyViolation, msg=method):
-                ph.guard_rest(method, "Objects/Addresses", {"location": "shared"})
+                ph.guard_rest(method, "Policies/SecurityPreRules", {"location": "shared"})
         for endpoint, query in (
             ("Objects/Tags", {"location": "shared"}),                         # not allowlisted
-            ("Objects/Addresses", {"location": "shared", "name": "x"}),       # extra parameter
-            ("Objects/Addresses", {"location": "shared", "newname": "y"}),    # rename parameter
-            ("Objects/Addresses", {"location": "vsys"}),                      # unknown location
+            ("Policies/SecurityPreRules", {"location": "shared", "name": "x"}),       # extra parameter
+            ("Policies/SecurityPreRules", {"location": "shared", "newname": "y"}),    # rename parameter
+            ("Policies/SecurityPreRules", {"location": "vsys"}),                      # unknown location
             ("Policies/SecurityPreRules", {"location": "device-group"}),      # missing device-group
             ("Policies/SecurityPreRules", {"location": "shared", "device-group": "DG"}),
             ("Policies/SecurityPreRules", {"location": "device-group", "device-group": "a\nb"}),
