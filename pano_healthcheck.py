@@ -729,8 +729,12 @@ class Collector:
             print("  [dry-run] + 2 config show calls per device group (pre/post rulebase)")
 
         rows = []
+        total = len(locations) * 2
+        step = 0
         for location, base in locations:
             for rulebase in ("pre-rulebase", "post-rulebase"):
+                step += 1
+                started = time.monotonic()
                 try:
                     result = self.client.config_show(f"{base}/{rulebase}/security/rules")
                 except ApiError as exc:
@@ -738,8 +742,10 @@ class Collector:
                         continue
                     raise
                 rules_el = next(result.iter("rules"), result)
-                for position, entry in enumerate(rules_el.findall("entry"), start=1):
+                entries = rules_el.findall("entry")
+                for position, entry in enumerate(entries, start=1):
                     rows.append(rule_row(location, rulebase, position, entry))
+                self._progress(step, total, location, rulebase, len(entries), started)
         self.data["rules"] = rows
 
     # ---- REST API mode: only configuration data exists in the REST API ----
@@ -800,11 +806,15 @@ class Collector:
 
         rows = []
         denied = set()
+        total = len(locations) * 2
+        step = 0
         for location, query in locations:
             for rulebase, endpoint in (("pre-rulebase", "Policies/SecurityPreRules"),
                                        ("post-rulebase", "Policies/SecurityPostRules")):
+                step += 1
                 if endpoint in denied:
                     continue
+                started = time.monotonic()
                 try:
                     entries = self.client.rest_get(endpoint, query)
                 except ApiError as exc:
@@ -812,11 +822,18 @@ class Collector:
                         denied.add(endpoint)  # don't repeat a denied call for every device group
                     self._error(f"rules ({location} {rulebase})", exc)
                     continue
+                before = len(rows)
                 for position, entry in enumerate(entries, start=1):
                     if entry.get("@location") and entry["@location"] != query["location"]:
                         continue  # inherited from another location; collected there
                     rows.append(rule_row(location, rulebase, position, json_to_element("entry", entry)))
+                self._progress(step, total, location, rulebase, len(rows) - before, started)
         self.data["rules"] = rows
+
+    def _progress(self, step, total, location, rulebase, count, started):
+        if not self.client.dry_run:
+            print(f"  [{step}/{total}] {location} {rulebase}: {count} rules ({time.monotonic() - started:.1f}s)",
+                  flush=True)
 
     def collect_logs(self):
         since = (datetime.now() - timedelta(hours=self.settings.log_window_hours)).strftime("%Y/%m/%d %H:%M:%S")
