@@ -85,6 +85,13 @@ class Settings:
     enable_targeted: bool
     max_targeted: int
     output_dir: Path
+    key_source: str = ""
+
+    def key_label(self):
+        """Masked key description, for comparing with the key used in curl."""
+        if not self.api_key:
+            return "no API key"
+        return f"API key ...{self.api_key[-4:]} ({len(self.api_key)} chars, from {self.key_source})"
 
 
 def load_env_file(path):
@@ -112,9 +119,12 @@ def load_settings(env_path, environ=None, require_key=True):
     environ = os.environ if environ is None else environ
     values = dict(DEFAULTS)
     values.update(load_env_file(env_path))
+    key_source = f"{env_path}"
     for key in DEFAULTS:
         if key not in FILE_ONLY_KEYS and environ.get(key):
             values[key] = environ[key]
+            if key == "PANORAMA_API_KEY":
+                key_source = "environment variable PANORAMA_API_KEY"
 
     host = values["PANORAMA_HOST"].strip()
     allowed = [h.strip().lower() for h in values["ALLOWED_HOSTS"].split(",") if h.strip()]
@@ -150,6 +160,7 @@ def load_settings(env_path, environ=None, require_key=True):
             enable_targeted=_bool(values["ENABLE_TARGETED"]),
             max_targeted=int(values["MAX_TARGETED_FIREWALLS"]),
             output_dir=output_dir,
+            key_source=key_source,
         )
     except ValueError as exc:
         raise ConfigError(f"Invalid number in .env: {exc}") from None
@@ -260,11 +271,16 @@ API_ERROR_CODES = {
 ROLE_PERMISSION = {"op": "Operational Requests", "config": "Configuration", "log": "Log"}
 
 
-def error_hint(code, req_type):
+def error_hint(code, req_type, message=""):
     perm = ROLE_PERMISSION.get(req_type, "the matching")
     if code in ("16", "403"):
+        if "not authorized for user role" in message:
+            return (f"The key is valid, but its admin role does not allow '{perm}'. On Panorama: "
+                    f"Panorama > Admin Roles > <role> > XML API tab > enable '{perm}', then commit "
+                    "on Panorama. Each XML API permission is separate, so config queries can work "
+                    "while this one is denied.")
         return (f"Check the API key, and that its admin role has XML API > '{perm}' enabled "
-                "(Device > Admin Roles on Panorama).")
+                "(Panorama > Admin Roles).")
     if code in ("1", "17", "18"):
         return "Panorama did not accept the command syntax; it may not exist on this PAN-OS version."
     if code == "22":
@@ -280,7 +296,7 @@ class ApiError(Exception):
         text = message
         if code:
             text = f"[code {code}{': ' + meaning if meaning else ''}] {message}"
-        hint = error_hint(code, req_type)
+        hint = error_hint(code, req_type, message)
         if hint:
             text += f" -> {hint}"
         super().__init__(text)
@@ -490,9 +506,12 @@ class Collector:
             except ReadOnlyViolation:
                 raise
             except ApiError as exc:
-                print(f"  ! {name}: {exc}")
-                self.data["errors"].append({"section": name, "error": str(exc)})
+                self._error(name, exc)
         return self.data
+
+    def _error(self, section, exc):
+        print(f"  ! {section}: {exc}")
+        self.data["errors"].append({"section": section, "error": str(exc)})
 
     def collect_panorama(self):
         info = self.client.op("system_info")
@@ -501,7 +520,7 @@ class Collector:
         try:
             self.data["panorama_ha"] = flatten(self.client.op("ha_state"))
         except ApiError as exc:
-            self.data["errors"].append({"section": "panorama (HA)", "error": str(exc)})
+            self._error("panorama (HA)", exc)
 
     def collect_devices(self):
         result = self.client.op("devices_all")
@@ -523,7 +542,7 @@ class Collector:
             tpl_result = self.client.op("templates")
             rows += self._sync_rows("template", tpl_result.findall("./templates/entry"))
         except ApiError as exc:
-            self.data["errors"].append({"section": "sync (templates)", "error": str(exc)})
+            self._error("sync (templates)", exc)
         self.data["sync"] = rows
 
     @staticmethod
@@ -575,9 +594,13 @@ class Collector:
 
     def collect_rules(self):
         if self._device_groups is None:
-            dg_result = self.client.op("devicegroups")
-            self._device_groups = [e.get("name") for e in dg_result.findall("./devicegroups/entry")
-                                   if e.get("name")]
+            # Read device-group names from config so this section only needs the
+            # 'Configuration' XML API permission.
+            names = self.client.request(
+                {"type": "config", "action": "get",
+                 "xpath": f"{PANORAMA_DEVICE_XPATH}/device-group/entry/@name"},
+                "config get device-group names")
+            self._device_groups = [e.get("name") for e in top_entries(names) if e.get("name")]
         locations = [("shared", "/config/shared")]
         locations += [(dg, f"{PANORAMA_DEVICE_XPATH}/device-group/entry[@name='{dg}']")
                       for dg in self._device_groups]
@@ -609,7 +632,7 @@ class Collector:
                 entries = self.client.log_query(log_type, query, self.settings.max_logs)
                 self.data[key] = [flatten(e) for e in entries]
             except ApiError as exc:
-                self.data["errors"].append({"section": f"logs ({log_type})", "error": str(exc)})
+                self._error(f"logs ({log_type})", exc)
 
     def collect_targeted(self):
         serials = [d.get("serial", "") for d in self.data["devices"] if d.get("connected") == "yes"]
@@ -1045,7 +1068,8 @@ def write_html(path, data, findings, settings, calls, started):
 # --------------------------------------------------------------------------
 
 def diagnose(client):
-    print(f"Diagnosing API access to {client.settings.host} (read-only checks)\n")
+    print(f"Diagnosing API access to {client.settings.host} (read-only checks)")
+    print(f"Using {client.settings.key_label()}\n")
     checks = [
         ("Operational request: show system info", lambda: client.op("system_info")),
         ("Operational request: show devices all", lambda: client.op("devices_all")),
@@ -1108,8 +1132,11 @@ def main(argv=None, transport=None):
         print("--format must be html, csv or html,csv", file=sys.stderr)
         return 2
 
-    if not settings.verify_tls and not args.dry_run:
-        print("Warning: TLS certificate verification is off (VERIFY_TLS=false). Lab use only.\n")
+    if not args.dry_run:
+        print(f"Panorama {settings.host}, using {settings.key_label()}")
+        if not settings.verify_tls:
+            print("Warning: TLS certificate verification is off (VERIFY_TLS=false). Lab use only.")
+        print()
 
     client = PanoramaClient(settings, dry_run=args.dry_run, transport=transport)
 

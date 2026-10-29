@@ -28,6 +28,11 @@ The default run (without `--targeted`) makes about 10 calls, plus 2 per device g
 
 ## How to run (step by step)
 
+> **On macOS:**
+> - Type `python3` instead of `python`.
+> - Use `cp .env.example .env` instead of `copy`.
+> - Open the newest report with `open "$(ls -d reports/*/ | tail -1)report.html"`.
+
 ### 1. Check that Python is installed
 
 Open **PowerShell** or **Command Prompt** and run:
@@ -163,7 +168,8 @@ If one section fails, for example because the role is missing a permission, the 
 
 | Code | Meaning | Usual fix |
 |---|---|---|
-| 16 / 403 | Not authorised | Enable the matching **XML API** permission on the admin role (Operational Requests, Configuration or Log), or check the key |
+| 403 "Type [op] not authorized for user role" | The key is **valid**, but its admin role doesn't allow operational commands. Config queries can still work, because each XML API permission is separate | On Panorama: **Panorama > Admin Roles > *role* > XML API**, enable **Operational Requests** (and **Log**), then **Commit to Panorama**. If you aren't a Panorama admin, ask one to do this |
+| 16 / 403 (other) | Not authorised | Enable the matching **XML API** permission on the admin role (Operational Requests, Configuration or Log), or check the key |
 | 17 / 18 / 1 | Invalid, malformed or unknown command | The command is not valid on this PAN-OS version |
 | 22 | Session timed out | Generate a new key |
 | "response was not XML" | A proxy or the wrong host answered | Check `PANORAMA_HOST`; keep `BYPASS_PROXY=true` |

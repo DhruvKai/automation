@@ -70,7 +70,13 @@ RULES_DG = """<response status="success"><result><rules>
  <action>deny</action><disabled>yes</disabled><log-end>no</log-end></entry>
 </rules></result></response>"""
 
-NOT_PRESENT = """<response status="error" code="7"><msg><line>No such node</line></msg></response>"""
+DG_NAMES = """<response status="success"><result total-count="1" count="1">
+<entry name="DG-Branch"/></result></response>"""
+
+OP_DENIED = """<response status="error" code="403"><result><msg>Type [op] not authorized for user role.</msg>
+</result></response>"""
+
+NOT_PRESENT ="""<response status="error" code="7"><msg><line>No such node</line></msg></response>"""
 
 LOG_ENQUEUE = """<response status="success"><result><msg><line>query job enqueued with jobid 7</line></msg>
 <job>7</job></result></response>"""
@@ -107,6 +113,8 @@ class FakePanorama:
                 "system_resources": TOP_TEXT,
             }[name].encode()
         if t == "config":
+            if params["xpath"].endswith("/device-group/entry/@name"):
+                return DG_NAMES.encode()
             if "DG-Branch" in params["xpath"] and "pre-rulebase" in params["xpath"]:
                 return RULES_DG.encode()
             return NOT_PRESENT.encode()
@@ -298,6 +306,23 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("SECRET-KEY", html_text)
         for params, _ in fake.sent:
             self.assertIn(params["type"], ("op", "config", "log"))
+
+    def test_rules_collected_when_op_is_denied(self):
+        fake = FakePanorama()
+
+        def op_denied(body, headers):
+            if b"type=op" in body:
+                fake.sent.append((dict(urllib.parse.parse_qsl(body.decode())), headers))
+                return OP_DENIED.encode()
+            return fake(body, headers)
+
+        client = ph.PanoramaClient(make_settings(), transport=op_denied, log=lambda *_: None)
+        with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(ph.time, "sleep"):
+            data = ph.Collector(client, make_settings()).run(["devices", "rules", "logs"])
+        self.assertEqual(len(data["rules"]), 3)
+        self.assertEqual(len(data["system_logs"]), 1)
+        self.assertEqual([e["section"] for e in data["errors"]], ["devices"])
+        self.assertIn("does not allow 'Operational Requests'", out.getvalue())
 
     def test_dry_run_sends_nothing(self):
         code, fake, out_dir, stdout = self.run_main("--dry-run")
