@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import sys
+import re
 import tempfile
 import time
 import unittest
@@ -132,6 +133,40 @@ TEMPLATE_CERTS = f"""<response status="success"><result total-count="1" count="1
  <private-key>PRIVATEBLOB</private-key></entry></certificate></result></response>"""
 
 
+HA_ALL = """<response status="success"><result><enabled>yes</enabled><group><mode>Active-Passive</mode>
+<local-info><state>active</state><priority>100</priority><preemptive>no</preemptive><state-sync>Complete</state-sync>
+</local-info><peer-info><conn-status>up</conn-status><state>passive</state>
+<conn-ha1><conn-status>up</conn-status></conn-ha1><conn-ha2><conn-status>down</conn-status></conn-ha2></peer-info>
+<link-monitoring><enabled>yes</enabled></link-monitoring><path-monitoring><enabled>no</enabled></path-monitoring>
+<running-sync>not synchronized</running-sync><running-sync-enabled>yes</running-sync-enabled></group>
+</result></response>"""
+
+_NOW = time.time()
+_STAMP = lambda seconds_ago: time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime(_NOW - seconds_ago))  # noqa: E731
+
+LOGGING_STATUS = f"""<response status="success"><result><![CDATA[
+>Log Collection Service
+'Log Collection log forwarding agent' is active and connected to 192.0.2.50
+
+   -----------------------------------------------------------------------------------------------------
+        Type      Last Log Created        Last Log Fwded       Last Seq Num Fwded  Last Seq Num Acked
+   -----------------------------------------------------------------------------------------------------
+      config   {_STAMP(600)}    {_STAMP(600)}          100        100
+      system   {_STAMP(300)}    {_STAMP(300 + 90 * 60)}          200        200
+     traffic   Not Available          Not Available                 0          0
+]]></result></response>"""
+
+LOGGING_DOWN = """<response status="success"><result><![CDATA[
+>Log Collection Service
+'Log Collection log forwarding agent' is not active.
+]]></result></response>"""
+
+FW_SYSTEM_INFO = f"""<response status="success"><result><system><hostname>fw-a</hostname>
+<sw-version>10.2.10</sw-version><av-version>4800-5300</av-version>
+<av-release-date>{_STAMP(10 * 86400 + 3600)} PDT</av-release-date>
+<app-version>8800-8000</app-version><app-release-date>{_STAMP(2 * 86400 + 3600)} PDT</app-release-date>
+</system></result></response>"""
+
 REST_DEVICE_GROUPS = {"@status": "success", "@code": "19", "result": {"@count": "1", "entry": [
     {"@name": "DG-Branch", "devices": {"entry": [{"@name": "001"}, {"@name": "002"}]}},
     {"@name": "DG-DC"}, {"@name": "DG-Lab"}]}}
@@ -184,7 +219,10 @@ class FakePanorama:
         t = params["type"]
         if t == "op":
             name = next(k for k, v in ph.OP_COMMANDS.items() if v == params["cmd"])
+            if params.get("target") and name == "system_info":
+                return FW_SYSTEM_INFO.encode()
             return {
+                "ha_all": HA_ALL, "logging_status": LOGGING_STATUS,
                 "system_info": SYSTEM_INFO, "ha_state": HA_STATE, "devices_all": DEVICES_ALL,
                 "devicegroups": DEVICEGROUPS, "templates": TEMPLATES, "jobs_all": JOBS,
                 "log_collectors": LOG_COLLECTORS, "session_info": SESSION_INFO,
@@ -194,6 +232,8 @@ class FakePanorama:
         if t == "config":
             if params["xpath"].endswith("/device-group/entry/@name"):
                 return DG_NAMES.encode()
+            if params["xpath"].endswith("/deviceconfig/system/hostname"):
+                return b'<response status="success"><result><hostname>pano-lab</hostname></result></response>'
             if params["xpath"] == "/config/shared/certificate":
                 return SHARED_CERTS.encode()
             if "TPL-Branch" in params["xpath"] and params["xpath"].endswith("/certificate"):
@@ -206,6 +246,16 @@ class FakePanorama:
                 return SYSTEM_LOGS.encode()
             return LOG_ENQUEUE.encode()
         raise AssertionError(f"unexpected request {params}")
+
+
+class ThreeGroupPanorama(FakePanorama):
+    """Panorama whose config lists three device groups."""
+
+    def xml(self, params):
+        if params["type"] == "config" and params["xpath"].endswith("/device-group/entry/@name"):
+            return (b'<response status="success"><result><entry name="DG-Branch"/><entry name="DG-DC"/>'
+                    b'<entry name="DG-Lab"/></result></response>')
+        return super().xml(params)
 
 
 def make_settings(**overrides):
@@ -358,10 +408,10 @@ class SettingsTests(unittest.TestCase):
             ph.load_settings(path, environ={})
         self.assertIn("PANORAMA_XML_API_KEY", str(ctx.exception))
 
-    def test_rest_is_default_mode(self):
-        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=k\n")
-        settings = ph.load_settings(path, environ={})
-        self.assertEqual((settings.api_mode, settings.rest_version), ("rest", "v11.0"))
+    def test_xml_is_the_only_default_mode(self):
+        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=k\nAPI_MODE=rest\n")
+        settings = ph.load_settings(path, environ={"API_MODE": "rest"})
+        self.assertEqual((settings.api_mode, settings.rest_version), ("xml", "v11.0"))
 
 
 class ClientTests(unittest.TestCase):
@@ -453,6 +503,35 @@ class ParserTests(unittest.TestCase):
         ses = ph.parse_session_info(ET.fromstring(SESSION_INFO).find("result"))
         self.assertEqual(ses["session_util_pct"], "85.0")
 
+    def test_ha_pairs(self):
+        devices = [
+            {"serial": "1", "hostname": "a1", "connected": "yes", "ha/state": "active", "ha/peer/serial": "2"},
+            {"serial": "2", "hostname": "a2", "connected": "yes", "ha/state": "active", "ha/peer/serial": "1"},
+            {"serial": "3", "hostname": "b1", "connected": "yes", "ha/state": "passive", "ha/peer/serial": "4"},
+            {"serial": "4", "hostname": "b2", "connected": "yes", "ha/state": "passive", "ha/peer/serial": "3"},
+            {"serial": "5", "hostname": "c1", "connected": "yes", "ha/state": "active", "ha/peer/serial": "6"},
+            {"serial": "6", "hostname": "c2", "connected": "no", "ha/state": "passive", "ha/peer/serial": "5"},
+            {"serial": "7", "hostname": "d1", "connected": "yes", "ha/state": "active", "ha/peer/serial": "99"},
+            {"serial": "8", "hostname": "e1", "connected": "yes", "ha/state": "active-primary", "ha/peer/serial": "9"},
+            {"serial": "9", "hostname": "e2", "connected": "yes", "ha/state": "active-secondary", "ha/peer/serial": "8"},
+            {"serial": "10", "hostname": "solo", "connected": "yes"},
+        ]
+        status = {r["firewall"]: r["status"] for r in ph.ha_pairs(devices)}
+        self.assertEqual(status, {"a1": "both active (possible split brain)", "b1": "no active member",
+                                  "c1": "peer not connected", "d1": "peer not managed by Panorama", "e1": "ok"})
+        data = ph.Collector(None, make_settings()).data
+        data["devices"] = devices
+        severities = {f["finding"]: f["severity"] for f in ph.evaluate(data) if f["finding"].startswith("HA pair")}
+        self.assertEqual(severities["HA pair: both active (possible split brain)"], "critical")
+        self.assertEqual(severities["HA pair: no active member"], "high")
+
+    def test_sync_status(self):
+        self.assertEqual(ph.sync_status({"type": "template", "template-status": "Out of Sync"}), "Out of Sync")
+        self.assertEqual(ph.sync_status({"vsys/vsys1/shared-policy-status": "In Sync"}), "In Sync")
+        self.assertEqual(ph.sync_status({"last-commit-all-state-sp": "commit failed",
+                                         "shared-policy-status": "In Sync"}), "Commit failed")
+        self.assertEqual(ph.sync_status({"connected": "yes"}), "unknown")
+
     def test_parse_disk_space(self):
         rows = ph.parse_disk_space(ET.fromstring(DISK_SPACE).find("result"), "pano-lab", "P1")
         self.assertEqual([(r["mount"], r["use_pct"]) for r in rows],
@@ -510,6 +589,62 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(any(t == "fw-b" and "expires in" in f for t, f in found))
         self.assertFalse(any(t == "fw-c" for t, _ in found))
 
+    def test_parse_ha_details(self):
+        row = ph.parse_ha(ET.fromstring(HA_ALL).find("result"))
+        self.assertEqual((row["ha_mode"], row["ha_local_state"], row["ha_peer_state"]),
+                         ("Active-Passive", "active", "passive"))
+        self.assertEqual((row["ha1_status"], row["ha2_status"], row["ha_config_sync"]), ("up", "down", "not synchronized"))
+        self.assertEqual((row["ha_priority"], row["ha_state_sync"], row["ha_link_monitoring"]), ("100", "Complete", "yes"))
+
+    def test_parse_logging_status(self):
+        row = ph.parse_logging_status(ET.fromstring(LOGGING_STATUS).find("result"))
+        self.assertEqual((row["log_forwarding"], row["log_destination"], row["log_fwd_lag_min"]),
+                         ("connected", "192.0.2.50", "90"))
+        self.assertEqual(row["last_log_forwarded"], _STAMP(600))
+        down = ph.parse_logging_status(ET.fromstring(LOGGING_DOWN).find("result"))
+        self.assertEqual(down["log_forwarding"], "not connected")
+        self.assertEqual(ph.parse_logging_status(ET.Element("result"))["log_forwarding"], "")
+
+    def test_parse_content_age(self):
+        row = ph.parse_content(ET.fromstring(FW_SYSTEM_INFO).find("result"), now=_NOW)
+        self.assertEqual((row["av_age_days"], row["app_age_days"], row["wildfire_age_days"]), ("10", "2", ""))
+
+    def test_version_findings(self):
+        data = ph.Collector(None, make_settings()).data
+        data["panorama"] = {"sw-version": "10.2.8", "av-version": "4805-5310"}
+        data["devices"] = [
+            {"serial": "1", "hostname": "new", "connected": "yes", "sw-version": "11.1.2", "av-version": "4805-5310"},
+            {"serial": "2", "hostname": "maint", "connected": "yes", "sw-version": "10.2.9", "av-version": "4801-5306"},
+            {"serial": "3", "hostname": "ok", "connected": "yes", "sw-version": "10.2.8-h3", "av-version": "4804-5309"},
+        ]
+        found = {(f["target"], f["finding"]): f["severity"] for f in ph.evaluate(data) if f["area"] == "versions"}
+        self.assertEqual(found[("new", "Firewall runs a newer PAN-OS feature release than Panorama")], "high")
+        self.assertEqual(found[("maint", "Firewall runs a newer maintenance release than Panorama")], "low")
+        self.assertEqual(found[("maint", "Antivirus content is behind the newest in use")], "medium")  # 4 behind
+        self.assertEqual(found[("ok", "Antivirus content is behind the newest in use")], "low")
+        self.assertNotIn(("ok", "Firewall runs a newer maintenance release than Panorama"), found)
+
+    def test_firewall_status_rows(self):
+        dev_rows =[dict(ph.flatten(e), serial=e.get("name"))
+                    for e in ET.fromstring(DEVICES_ALL).find("result").findall("devices/entry")]
+        sync = (ph.Collector._sync_rows("device-group", ET.fromstring(DEVICEGROUPS).findall("result/devicegroups/entry"))
+                + ph.Collector._sync_rows("template", ET.fromstring(TEMPLATES).findall("result/templates/entry")))
+        rows = {r["hostname"]: r for r in ph.firewall_status(dev_rows, sync)}
+        self.assertEqual((rows["fw-a"]["device-group"], rows["fw-a"]["policy_sync"]), ("DG-Branch", "In Sync"))
+        self.assertEqual((rows["fw-a"]["template"], rows["fw-a"]["template_sync"]), ("TPL-Branch", "Out of Sync"))
+        self.assertEqual((rows["fw-a"]["ha_peer"], rows["fw-b"]["ha_peer"]), ("fw-b", "fw-a"))
+        self.assertEqual(rows["fw-c"]["policy_sync"], "")
+
+    def test_antivirus_profile_check(self):
+        rule = {"action": "allow", "disabled": "no", "source": "10.0.0.0/8", "destination": "any",
+                "application": "web-browsing", "service": "application-default", "log-end": "yes",
+                "log-setting": "fwd", "profiles": "spyware=strict, vulnerability=strict"}
+        self.assertIn(("low", "Allow rule without an antivirus profile"), ph.evaluate_rule(rule))
+        rule["profiles"] = "virus=default, spyware=strict"
+        self.assertEqual(ph.evaluate_rule(rule), [])
+        rule["profiles"] = "best-practice"  # a profile group: contents unknown, not flagged
+        self.assertEqual(ph.evaluate_rule(rule), [])
+
     def test_rule_evaluation(self):
         rules = ET.fromstring(RULES_DG).find("result/rules").findall("entry")
         rows = [ph.rule_row("DG", "pre-rulebase", i, e) for i, e in enumerate(rules, 1)]
@@ -521,13 +656,14 @@ class ParserTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
-    def run_main(self, *args, mode="xml"):
-        fake = FakePanorama()
+    def run_main(self, *args, mode="xml", xml_key=True, fake=None):
+        fake = fake or FakePanorama()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         env = Path(tmp.name) / ".env"
-        env.write_text(f"PANORAMA_HOST={LAB_HOST}\nALLOWED_HOSTS={LAB_HOST}\nPANORAMA_XML_API_KEY=SECRET-KEY\n"
-                       "PANORAMA_REST_API_KEY=REST-KEY\n"
+        env.write_text(f"PANORAMA_HOST={LAB_HOST}\nALLOWED_HOSTS={LAB_HOST}\n"
+                       + ("PANORAMA_XML_API_KEY=SECRET-KEY\n" if xml_key else "")
+                       + "PANORAMA_REST_API_KEY=REST-KEY\n"
                        f"REQUEST_DELAY_SEC=0\nAPI_MODE={mode}\n", encoding="utf-8")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(ph.time, "sleep"):  # skip log-poll waits
@@ -541,7 +677,7 @@ class EndToEndTests(unittest.TestCase):
         names = {p.name for p in report_dir.iterdir()}
         for expected in ("report.html", "inventory.csv", "sync_status.csv", "security_rules.csv",
                          "rule_findings.csv", "findings.csv", "jobs.csv", "system_logs.csv",
-                         "firewall_resources.csv", "certificates.csv", "disk_usage.csv"):
+                         "firewall_resources.csv", "certificates.csv", "disk_usage.csv", "firewall_status.csv"):
             self.assertIn(expected, names)
 
         findings = (report_dir / "findings.csv").read_text(encoding="utf-8-sig")
@@ -549,10 +685,18 @@ class EndToEndTests(unittest.TestCase):
                      "CommitAll failed", "Log collector not connected", "Session table utilisation",
                      "Clock is not synchronised to an NTP server", "/ is 95% full",
                      "shared: old-ca,Certificate expired",
-                     "template TPL-Branch: gp-portal,Certificate expires in 10 days"):
+                     "template TPL-Branch: gp-portal,Certificate expires in 10 days",
+                     "HA2 link is 'down'", "HA config is not synchronised with the peer",
+                     "Log forwarding is 90 minutes behind", "Antivirus content is 10 days old",
+                     "HA peers run different versions,app-version 8800-8000 vs 8700-7900",
+                     "Applications & Threats content is behind the newest in use"):
             self.assertIn(text, findings)
         self.assertNotIn("panlogs", findings)  # log partition is full by design
 
+        status = (report_dir / "firewall_status.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("fw-a,001,yes,10.2.10,8800-8000,4800-5300", status)
+        self.assertIn("DG-Branch,In Sync,TPL-Branch,Out of Sync", status)
+        self.assertIn("Active-Passive", status)
         disk = (report_dir / "disk_usage.csv").read_text(encoding="utf-8-sig")
         self.assertIn("pano-lab", disk)
         self.assertIn("fw-b", disk)  # targeted firewalls' disks too
@@ -569,35 +713,36 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn(params["type"], ("op", "config", "log"))
             self.assertEqual(headers["X-PAN-KEY"], "SECRET-KEY")  # XML key only
 
-    def test_rest_run_writes_rules_and_inventory(self):
-        code, fake, out_dir, stdout = self.run_main(mode="rest")
+    def test_api_mode_rest_in_env_never_hits_rest(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code, fake, out_dir, stdout = self.run_main(mode="rest")
         self.assertEqual(code, 0, stdout)
+        self.assertIn("API_MODE in .env is no longer used", err.getvalue())
+        self.assertTrue(all("type" in p for p, _ in fake.sent), "a REST call was made")
+        self.assertTrue(all(h["X-PAN-KEY"] == "SECRET-KEY" for _, h in fake.sent))
+
         report_dir = next(p for p in out_dir.iterdir() if p.is_dir())
-        names = {p.name for p in report_dir.iterdir()}
-        self.assertTrue({"report.html", "inventory.csv", "security_rules.csv", "rule_findings.csv",
-                         "findings.csv"} <= names)
-        self.assertNotIn("jobs.csv", names)  # not available through REST
-
-        inventory = (report_dir / "inventory.csv").read_text(encoding="utf-8-sig")
-        self.assertIn("001,DG-Branch,TS-Branch", inventory)
-        rules = (report_dir / "security_rules.csv").read_text(encoding="utf-8-sig")
-        self.assertIn("allow-any", rules)
-        self.assertIn("web-out", rules)
-        findings = (report_dir / "findings.csv").read_text(encoding="utf-8-sig")
-        self.assertIn("all 'any'", findings)
-        self.assertNotIn("not connected", findings)  # REST has no connectivity data; no false alarms
-
+        sync = (report_dir / "sync_status.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("template,TPL-Branch,fw-a,001,yes,Out of Sync", sync)
+        self.assertIn("device-group,DG-Branch,fw-a,001,yes,In Sync", sync)
+        ha = (report_dir / "ha_pairs.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("fw-a,001,active,fw-b,002,suspended,yes,degraded", ha)
         html_text = (report_dir / "report.html").read_text(encoding="utf-8")
-        self.assertIn("Not collected", html_text)
-        self.assertNotIn("REST-KEY", html_text)
-        self.assertTrue(all(h.get("X-PAN-KEY") == "REST-KEY" for _, h in fake.sent))  # REST key only
+        self.assertIn("XML API", html_text)
+        self.assertIn("Firewall HA pairs", html_text)
+        self.assertNotIn("Not collected", html_text)
 
-    def rule_calls(self, fake):
-        return [p.get("device-group", "shared") for p, _ in fake.sent if "location" in p
-                and p["location"] in ("shared", "device-group")]
+    @staticmethod
+    def rule_calls(fake):
+        calls = []
+        for p, _ in fake.sent:
+            m = re.search(r"(?:entry\[@name='([^']+)'\]|/config/shared)/(?:pre|post)-rulebase", p.get("xpath", ""))
+            if m:
+                calls.append(m.group(1) or "shared")
+        return calls
 
     def test_quick_limits_device_groups(self):
-        code, fake, out_dir, stdout = self.run_main("--quick", mode="rest")
+        code, fake, out_dir, stdout = self.run_main("--quick", "--sections", "rules", fake=ThreeGroupPanorama())
         self.assertEqual(code, 0, stdout)
         self.assertEqual(self.rule_calls(fake), ["shared", "shared", "DG-Branch", "DG-Branch", "DG-DC", "DG-DC"])
         self.assertIn("Limited run: security rules for shared + 2 of 3 device groups", stdout)
@@ -605,16 +750,18 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Limited run", (report_dir / "report.html").read_text(encoding="utf-8"))
 
     def test_device_groups_option(self):
-        code, fake, _, stdout = self.run_main("--device-groups", "DG-Lab,Nope", "--sections", "rules", mode="rest")
+        code, fake, _, stdout = self.run_main("--device-groups", "DG-Lab,Nope", "--sections", "rules",
+                                              fake=ThreeGroupPanorama())
         self.assertEqual(code, 0, stdout)
         self.assertEqual(self.rule_calls(fake), ["shared", "shared", "DG-Lab", "DG-Lab"])
         self.assertIn("not found on Panorama: Nope", stdout)
 
     def test_rest_diagnose(self):
         fake = FakePanorama()
-        client = ph.PanoramaClient(make_settings(api_mode="rest"), transport=fake, log=lambda *_: None)
+        client = ph.PanoramaClient(make_settings(), transport=fake, log=lambda *_: None)
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = ph.diagnose(client)
+            code = ph.diagnose(client, "rest")
+        self.assertTrue(all("type" not in p and h["X-PAN-KEY"] == "REST-KEY" for p, h in fake.sent))
         self.assertEqual(code, 0, out.getvalue())
         self.assertIn("PASS  Panorama/DeviceGroups (3: DG-Branch, DG-DC, DG-Lab)", out.getvalue())
 
@@ -689,6 +836,7 @@ class MenuTests(unittest.TestCase):
     def test_menu_is_populated_from_panorama(self):
         screen = self.run_app(self.make_app(["q"]))
         self.assertEqual(self.op_calls(), [("devices_all", None), ("devicegroups", None), ("templates", None)])
+        self.assertTrue(all("type" in p for p, _ in self.fake.sent), "the menu hit the REST API by default")
         for text in ("3 firewalls (1 not connected)", "1 device groups", "1 templates",
                      "Full health check", "~21 calls", "Bye."):
             self.assertIn(text, screen)
@@ -719,6 +867,9 @@ class MenuTests(unittest.TestCase):
         self.assertIn("Live status: fw-a", screen)
         self.assertIn("Dataplane CPU %", screen)
         self.assertIn("61.3", screen)
+        for text in ("Policy sync", "Template sync", "HA2 link", "Log forwarding", "192.0.2.50",
+                     "Antivirus age (days)", "HA peers run different versions"):
+            self.assertIn(text, screen)
         self.assertEqual({t for _, t in self.op_calls() if t}, {"001"})
 
     def test_browse_device_group_and_jobs(self):
@@ -727,17 +878,64 @@ class MenuTests(unittest.TestCase):
         self.assertIn("Recent jobs (2, 1 failed)", screen)
         self.assertIn("Job 41", screen)
 
-    def test_rest_mode_disables_browse(self):
-        screen = self.run_app(self.make_app(["4", "q"], api_mode="rest"))
-        self.assertIn("Not available: needs API_MODE=xml", screen)
-        self.assertTrue(all(h["X-PAN-KEY"] == "REST-KEY" for _, h in self.fake.sent))
+    def test_browse_ha_and_sync(self):
+        screen = self.run_app(self.make_app(["4", "h", "", "b", "q"]))
+        for text in ("XML API", "HA & sync overview", "Firewall HA pairs", "degraded", "Out of Sync 1", "TPL-Branch"):
+            self.assertIn(text, screen)
+
+    def test_rest_only_through_its_menu_option(self):
+        # REST option -> run -> back from results -> back from the REST menu -> quit
+        screen = self.run_app(self.make_app(["9", "r", "b", "b", "q"]))
+        self.assertIn("REST API (optional, GET only)", screen)
+        rest = [(p, h) for p, h in self.fake.sent if "type" not in p]
+        self.assertTrue(rest)
+        self.assertTrue(all(h["X-PAN-KEY"] == "REST-KEY" for _, h in rest))
+        self.assertTrue(all("type" in p for p, _ in self.fake.sent[:3]))  # inventory before it was XML
+        report = next(p for p in self.out_dir.iterdir() if p.is_dir())
+        self.assertIn("001,DG-Branch,TS-Branch", (report / "inventory.csv").read_text(encoding="utf-8-sig"))
+        rules = (report / "security_rules.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("allow-any", rules)
+        self.assertIn("REST API", (report / "report.html").read_text(encoding="utf-8"))
+        self.assertNotIn("REST-KEY", (report / "report.html").read_text(encoding="utf-8"))
+
+    def test_rest_option_disabled_without_rest_key(self):
+        screen = self.run_app(self.make_app(["9", "q"], rest_api_key=""))
+        self.assertIn("Not available: PANORAMA_REST_API_KEY is empty in .env", screen)
+        self.assertTrue(all("type" in p for p, _ in self.fake.sent))
 
     def test_settings_never_exceed_env_limits(self):
-        app = self.make_app(["8", "t", "50", "", "d", "0.2", "", "w", "48", "m", "b", "q"], request_delay=1.0)
+        app = self.make_app(["8", "t", "50", "", "d", "0.2", "", "w", "48", "b", "q"], request_delay=1.0)
         self.run_app(app)
         self.assertEqual((app.settings.max_targeted, app.settings.request_delay), (5, 1.0))
         self.assertEqual(app.settings.log_window_hours, 48)
-        self.assertEqual(app.settings.api_mode, "rest")  # switched; the REST key is set
+
+    def make_reports(self):
+        for name in ("20260101-000000", "20260102-000000", "keep-me"):
+            (self.out_dir / name).mkdir()
+            (self.out_dir / name / "findings.csv").write_text("severity\nhigh\n", encoding="utf-8")
+        (self.out_dir / "notes.txt").write_text("not a report", encoding="utf-8")
+
+    def remaining(self):
+        return sorted(p.name for p in self.out_dir.iterdir())
+
+    def test_clear_all_reports_needs_confirmation(self):
+        app = self.make_app(["7", "x", "no", "", "q"])
+        self.make_reports()
+        screen = self.run_app(app)
+        self.assertIn("Cancelled; nothing was deleted", screen)
+        self.assertEqual(self.remaining(), ["20260101-000000", "20260102-000000", "keep-me", "notes.txt"])
+
+        app = self.make_app(["7", "x", "DELETE", "", "q"])
+        self.make_reports()
+        screen = self.run_app(app)
+        self.assertIn("Deleted 2 report folder(s)", screen)
+        self.assertEqual(self.remaining(), ["keep-me", "notes.txt"])  # only timestamped report folders go
+
+    def test_delete_one_report(self):
+        app = self.make_app(["7", "1", "x", "DELETE", "", "", "q"])
+        self.make_reports()
+        self.run_app(app)
+        self.assertEqual(self.remaining(), ["20260101-000000", "keep-me", "notes.txt"])  # newest was deleted
 
     def test_past_reports(self):
         screen = self.run_app(self.make_app(["2", "b", "7", "1", "f", "", "b", "", "q"]))

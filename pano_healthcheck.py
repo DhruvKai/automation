@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Read-only Panorama health-check collector (proof of concept).
 
-Collects firewall health data from Panorama through the PAN-OS REST API
-(API_MODE=rest, the default) or XML API (API_MODE=xml) and writes an HTML
-report and/or CSV files. Python standard library only.
+Collects firewall health data from Panorama through the PAN-OS XML API and
+writes an HTML report and/or CSV files. The REST API is only used when it is
+chosen from the interactive menu. Python standard library only.
 
 Every request passes a guard before anything is sent. XML: only allowlisted
 `show` operational commands, config `show`/`get` reads and log queries
@@ -52,7 +52,6 @@ DEFAULTS = {
     "PANORAMA_XML_API_KEY": "",
     "PANORAMA_REST_API_KEY": "",
     "ALLOWED_HOSTS": "",
-    "API_MODE": "rest",
     "REST_VERSION": "v11.0",
     "DEVICE_GROUPS": "",
     "VERIFY_TLS": "false",
@@ -103,13 +102,13 @@ class Settings:
     output_dir: Path
     key_sources: dict = field(default_factory=dict)  # api mode -> where its key came from
     http_method: str = "POST"
-    api_mode: str = "xml"
+    api_mode: str = "xml"  # always xml, except for the menu's REST API option
     rest_version: str = "v11.0"
     device_groups: list = field(default_factory=list)
 
     @property
     def api_key(self):
-        """The key for the current API_MODE."""
+        """The key for the API this run uses."""
         return self.rest_api_key if self.api_mode == "rest" else self.xml_api_key
 
     def key_label(self):
@@ -178,12 +177,8 @@ def load_settings(env_path, environ=None, require_key=True):
         raise ConfigError("HTTP_METHOD must be POST or GET")
     if http_method == "GET" and not _bool(values["KEY_IN_HEADER"]):
         raise ConfigError("HTTP_METHOD=GET needs KEY_IN_HEADER=true; the key is never put in a URL")
-    api_mode = values["API_MODE"].strip().lower()
-    if api_mode not in ("rest", "xml"):
-        raise ConfigError("API_MODE must be rest or xml")
-    if require_key and not keys[api_mode]:
-        raise ConfigError(f"{API_KEY_VARS[api_mode]} is empty (API_MODE={api_mode}). "
-                          f"Put the lab {api_mode.upper()} API key in .env.")
+    if require_key and not keys["xml"]:
+        raise ConfigError(f"{API_KEY_VARS['xml']} is empty. Put the lab XML API key in .env.")
     rest_version = values["REST_VERSION"].strip()
     if not re.fullmatch(r"v\d+\.\d+", rest_version):
         raise ConfigError("REST_VERSION must look like v11.0 (your Panorama's major.minor version)")
@@ -213,7 +208,6 @@ def load_settings(env_path, environ=None, require_key=True):
             output_dir=output_dir,
             key_sources=key_sources,
             http_method=http_method,
-            api_mode=api_mode,
             rest_version=rest_version,
             device_groups=[g.strip() for g in values["DEVICE_GROUPS"].split(",") if g.strip()],
         )
@@ -242,13 +236,16 @@ OP_COMMANDS = {
     "system_resources": "<show><system><resources></resources></system></show>",
     "disk_space": "<show><system><disk-space></disk-space></system></show>",
     "ntp": "<show><ntp></ntp></show>",
+    # Per firewall (target=<serial>): HA mode, links and config sync, and log forwarding to Panorama/collectors.
+    "ha_all": "<show><high-availability><all></all></high-availability></show>",
+    "logging_status": "<show><logging-status></logging-status></show>",
     # Firewall dataplane CPU and packet buffers, last 1 minute.
     "dp_resources": "<show><running><resource-monitor><minute><last>1</last></minute></resource-monitor></running></show>",
 }
 ALLOWED_OP = frozenset(OP_COMMANDS.values())
 # Commands that may be proxied to a managed firewall with target=<serial>.
-TARGETED_OP = frozenset(OP_COMMANDS[n] for n in ("system_info", "ha_state", "session_info", "system_resources",
-                                                 "disk_space", "ntp", "dp_resources"))
+TARGETED_OP = frozenset(OP_COMMANDS[n] for n in ("system_info", "ha_all", "session_info", "system_resources",
+                                                 "disk_space", "ntp", "dp_resources", "logging_status"))
 
 ALLOWED_PARAMS = {
     "op": {"type", "cmd", "target"},
@@ -664,7 +661,8 @@ class Collector:
             except ApiError as exc:
                 self._error(name, exc)
         if self.data["unavailable"]:
-            print(f"Skipped (not available through the REST API): {', '.join(self.data['unavailable'])}")
+            print(f"Skipped (not available through the REST API): {', '.join(self.data['unavailable'])}. "
+                  "The default XML API run collects them.")
         return self.data
 
     def _error(self, section, exc):
@@ -727,8 +725,9 @@ class Collector:
                     "connected": flat.get("connected", ""),
                 }
                 for key, value in flat.items():
-                    if "status" in key or "sync" in key:
+                    if "status" in key or "sync" in key or "last-commit" in key:
                         row[key] = value
+                row["status"] = sync_status(row)
                 rows.append(row)
         return rows
 
@@ -1026,12 +1025,22 @@ def _ends(flat, suffix):
 
 
 def parse_ha(result):
+    """show high-availability all (or state): mode, states, links, config sync and monitoring."""
     flat = flatten(result)
     return {
         "ha_enabled": _ends(flat, "enabled"),
+        "ha_mode": _ends(flat, "group/mode") or _ends(flat, "mode"),
         "ha_local_state": _ends(flat, "local-info/state"),
         "ha_peer_state": _ends(flat, "peer-info/state"),
         "ha_peer_conn": _ends(flat, "peer-info/conn-status"),
+        "ha_priority": _ends(flat, "local-info/priority"),
+        "ha_preemptive": _ends(flat, "local-info/preemptive"),
+        "ha1_status": _ends(flat, "peer-info/conn-ha1/conn-status"),
+        "ha2_status": _ends(flat, "peer-info/conn-ha2/conn-status"),
+        "ha_config_sync": _ends(flat, "running-sync"),
+        "ha_state_sync": _ends(flat, "local-info/state-sync"),
+        "ha_link_monitoring": _ends(flat, "link-monitoring/enabled"),
+        "ha_path_monitoring": _ends(flat, "path-monitoring/enabled"),
     }
 
 
@@ -1105,22 +1114,71 @@ def parse_ntp(result):
     return {"ntp_synched": flat["synched"], "ntp_servers": "; ".join(servers)}
 
 
+def _epoch(value):
+    """Seconds since 1970 for epoch digits or a PAN-OS date string (time zone names ignored); None if unparseable."""
+    text = " ".join(str(value or "").split())
+    if text.isdigit():
+        return int(text)
+    text = re.sub(r"\s+[A-Z]{2,5}$", "", text)
+    for fmt in ("%b %d %H:%M:%S %Y", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return (datetime.strptime(text, fmt) - datetime(1970, 1, 1)).total_seconds()
+        except ValueError:
+            pass
+    return None
+
+
 def days_left(value, now=None):
     """Whole days until a date given as epoch seconds or a PAN-OS date string; '' if unparseable."""
-    text = " ".join(str(value or "").split())
+    expiry = _epoch(value)
     now = time.time() if now is None else now
-    expiry = None
-    if text.isdigit():
-        expiry = int(text)
-    else:
-        text = re.sub(r"\s+(GMT|UTC)$", "", text)
-        for fmt in ("%b %d %H:%M:%S %Y", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
-            try:
-                expiry = (datetime.strptime(text, fmt) - datetime(1970, 1, 1)).total_seconds()
-                break
-            except ValueError:
-                pass
     return "" if expiry is None else str(int((expiry - now) // 86400))
+
+
+def days_old(value, now=None):
+    """Whole days since a date; '' if unparseable."""
+    then = _epoch(value)
+    now = time.time() if now is None else now
+    return "" if then is None else str(int((now - then) // 86400))
+
+
+def parse_content(result, now=None):
+    """Content release dates and ages from a firewall's show system info."""
+    system = result.find("system")
+    flat = flatten(system if system is not None else result)
+    row = {}
+    for kind in ("av", "app", "wildfire"):
+        date = flat.get(f"{kind}-release-date", "")
+        row[f"{kind}_release_date"] = date
+        row[f"{kind}_age_days"] = days_old(date, now) if date else ""
+    return row
+
+
+LOG_TYPES = {"traffic", "threat", "system", "config", "url", "wildfire", "hipmatch", "userid", "auth", "data",
+             "gtp", "tunnel", "decryption", "globalprotect", "iptag", "sctp"}
+LOG_TIME = r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}|Not Available)"
+
+
+def parse_logging_status(result):
+    """show logging-status text: is the firewall forwarding logs, to where, and how far behind."""
+    text = "\n".join(result.itertext())
+    row = {"log_forwarding": "", "log_destination": "", "last_log_forwarded": "", "log_fwd_lag_min": ""}
+    connected = re.search(r"is active and connected to\s+([\w.:\[\]-]+)", text)
+    if connected:
+        row["log_forwarding"], row["log_destination"] = "connected", connected.group(1)
+    elif re.search(r"not connected|is not active|disconnected", text, re.I):
+        row["log_forwarding"] = "not connected"
+    lags = []
+    for m in re.finditer(rf"^\s*([a-z-]+)\s+{LOG_TIME}\s+{LOG_TIME}", text, re.M):
+        kind, created, forwarded = m.groups()
+        if kind not in LOG_TYPES or created == "Not Available":
+            continue
+        if forwarded != "Not Available":
+            row["last_log_forwarded"] = max(row["last_log_forwarded"], forwarded)
+            lags.append((_epoch(created) - _epoch(forwarded)) / 60)
+    if lags:
+        row["log_fwd_lag_min"] = f"{max(0, max(lags)):.0f}"
+    return row
 
 
 CERT_FIELDS = ("common-name", "subject", "issuer", "not-valid-before", "not-valid-after", "expiry-epoch",
@@ -1138,12 +1196,125 @@ def certificate_row(location, entry, now=None):
     return row
 
 
+SYNC_ID_KEYS = ("type", "group", "hostname", "serial", "connected", "status")
+
+
+def _out_of_sync(value):
+    low = value.lower()
+    return "out of sync" in low or "out-of-sync" in low
+
+
+def sync_status(row):
+    """One status for a device-group/template member: 'Out of Sync', 'Commit failed', 'In Sync' or 'unknown'."""
+    values = [v for k, v in row.items() if k not in SYNC_ID_KEYS and v]
+    if any(_out_of_sync(v) for v in values):
+        return "Out of Sync"
+    if any("fail" in v.lower() for v in values):
+        return "Commit failed"
+    if any("in sync" in v.lower() or "in-sync" in v.lower() for v in values):
+        return "In Sync"
+    return "unknown"
+
+
+def ha_pairs(devices):
+    """HA pairs from show devices all (ha/state, ha/peer/serial): one row per pair or lone HA member."""
+    by_serial = {d.get("serial", ""): d for d in devices}
+    rows, seen = [], set()
+    for dev in devices:
+        serial, state = dev.get("serial", ""), dev.get("ha/state", "").lower()
+        peer_serial = dev.get("ha/peer/serial", "")
+        if serial in seen or (not peer_serial and state in ("", "disabled")):
+            continue
+        peer = by_serial.get(peer_serial)
+        seen |= {serial, peer_serial}
+        peer_state = (peer or {}).get("ha/state", "").lower()
+        if not peer_serial:
+            status = "no peer reported"
+        elif peer is None:
+            status = "peer not managed by Panorama"
+        elif peer.get("connected") != "yes":
+            status = "peer not connected"
+        elif state == "active" and peer_state == "active":
+            status = "both active (possible split brain)"
+        elif state == "passive" and peer_state == "passive":
+            status = "no active member"
+        elif state not in HEALTHY_HA_STATES or peer_state not in HEALTHY_HA_STATES:
+            status = "degraded"
+        else:
+            status = "ok"
+        mismatch = "; ".join(f"{f} {dev.get(f, '')} vs {peer.get(f, '')}" for f in HA_VERSION_FIELDS
+                             if peer and dev.get(f) and peer.get(f) and dev.get(f) != peer.get(f))
+        rows.append({
+            "firewall": dev.get("hostname") or serial, "serial": serial, "state": state or "-",
+            "peer": (peer or {}).get("hostname") or peer_serial or "-", "peer_serial": peer_serial,
+            "peer_state": peer_state or "-", "peer_connected": (peer or {}).get("connected", "-"), "status": status,
+            "version_mismatch": mismatch,
+        })
+    return rows
+
+
+def _version(text):
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(n) for n in m.groups()) if m else None
+
+
+def _content(text):
+    m = re.match(r"(\d+)", text or "")
+    return int(m.group(1)) if m else None
+
+
+HA_VERSION_FIELDS = ("sw-version", "app-version", "av-version")
+
+
+def firewall_status(devices, sync_rows, resources=()):
+    """One row per firewall: versions, device-group/template sync, HA and logging, from data already collected."""
+    pairs = {}
+    for pair in ha_pairs(devices):
+        pairs[pair["serial"]] = (pair["peer"], pair["status"])
+        if pair["peer_serial"]:
+            pairs[pair["peer_serial"]] = (pair["firewall"], pair["status"])
+    live = {r.get("serial"): r for r in resources}
+    rows = []
+    for dev in devices:
+        serial = dev.get("serial", "")
+        member = [r for r in sync_rows if r.get("serial") == serial]
+        r = live.get(serial, {})
+        peer, pair_status = pairs.get(serial, ("", ""))
+
+        def joined(kind, key):
+            return ", ".join(m[key] for m in member if m["type"] == kind)
+
+        rows.append({
+            "hostname": dev.get("hostname", ""), "serial": serial, "model": dev.get("model", ""),
+            "connected": dev.get("connected", ""), "sw-version": dev.get("sw-version", ""),
+            "app-version": dev.get("app-version", ""), "av-version": dev.get("av-version", ""),
+            "wildfire-version": dev.get("wildfire-version", ""),
+            "url-filtering-version": dev.get("url-filtering-version", ""),
+            "device-group": joined("device-group", "group"), "policy_sync": joined("device-group", "status"),
+            "template": joined("template", "group"), "template_sync": joined("template", "status"),
+            "last_commit": ", ".join(v for k, v in dev.items() if "last-commit-all" in k and v),
+            "ha_state": dev.get("ha/state", ""), "ha_peer": peer, "ha_pair": pair_status,
+            "ha_mode": r.get("ha_mode", ""), "ha_config_sync": r.get("ha_config_sync", ""),
+            "ha_links": ", ".join(f"{k} {r[k]}" for k in ("ha1_status", "ha2_status") if r.get(k)).replace("_status", ""),
+            "log_forwarding": r.get("log_forwarding", ""), "log_destination": r.get("log_destination", ""),
+            "last_log_forwarded": r.get("last_log_forwarded", ""), "av_age_days": r.get("av_age_days", ""),
+        })
+    return rows
+
+
+HA_PAIR_SEVERITY = {"both active (possible split brain)": "critical", "no active member": "high",
+                    "peer not connected": "medium", "peer not managed by Panorama": "low",
+                    "no peer reported": "low"}
+
+
 # Per-firewall calls for --targeted, in order, with their parsers (disk_space is handled separately).
 TARGETED_CALLS = {
-    "ha_state": parse_ha,
+    "ha_all": parse_ha,
     "session_info": parse_session_info,
     "system_resources": parse_resources,
     "dp_resources": parse_dp_resources,
+    "logging_status": parse_logging_status,
+    "system_info": parse_content,
     "disk_space": None,
 }
 
@@ -1163,6 +1334,11 @@ LOAD_LIMITS = (("session_util_pct", "Session table utilisation", 80),
                ("dp_cpu_pct", "Dataplane CPU", 80),
                ("packet_buffer_pct", "Packet buffer", 80))
 DISK_LIMITS = (("high", 90), ("medium", 80))
+AV_MAX_AGE_DAYS = 3        # antivirus content is released daily
+APP_MAX_AGE_DAYS = 30      # applications & threats content
+LOG_LAG_MINUTES = 60       # log forwarding behind by this much is flagged
+CONTENT_FIELDS = (("app-version", "Applications & Threats content"), ("av-version", "Antivirus content"),
+                  ("wildfire-version", "WildFire content"))
 
 
 def _finding(findings, severity, area, target, finding, detail=""):
@@ -1182,6 +1358,8 @@ def evaluate_rule(rule):
         issues.append(("medium", "Allow rule with application 'any' and service 'any'"))
     if allow and not rule["profiles"]:
         issues.append(("medium", "Allow rule without security profiles"))
+    elif allow and "=" in rule["profiles"] and "virus=" not in rule["profiles"]:
+        issues.append(("low", "Allow rule without an antivirus profile"))  # individual profiles, no group
     if rule["log-end"] == "no":
         issues.append(("medium", "Logging at session end is disabled"))
     if allow and not rule["log-setting"]:
@@ -1223,9 +1401,18 @@ def evaluate(data):
             elif "commit" in key and "fail" in low:
                 _finding(findings, "high", "sync", name, f"{key} is '{value}'")
 
+    for pair in ha_pairs(devices):
+        severity = HA_PAIR_SEVERITY.get(pair["status"])
+        if severity:
+            _finding(findings, severity, "high-availability", f"{pair['firewall']} / {pair['peer']}",
+                     f"HA pair: {pair['status']}", f"states {pair['state']} / {pair['peer_state']}")
+        if pair["version_mismatch"]:
+            _finding(findings, "high", "high-availability", f"{pair['firewall']} / {pair['peer']}",
+                     "HA peers run different versions", pair["version_mismatch"])
+
     for row in data["sync"]:
         for key, value in row.items():
-            if key in ("type", "group", "hostname", "serial", "connected"):
+            if key in SYNC_ID_KEYS:
                 continue
             low = value.lower()
             if "out of sync" in low or "out-of-sync" in low or "fail" in low:
@@ -1233,17 +1420,40 @@ def evaluate(data):
                          f"{row['type']} '{row['group']}': {key} is '{value}'")
 
     connected = [d for d in devices if d.get("connected") == "yes"]
-    for field, label in (("app-version", "Applications & Threats content"),
-                         ("av-version", "Antivirus content"),
-                         ("sw-version", "PAN-OS version")):
-        values = Counter(d.get(field, "") for d in connected if d.get(field))
-        if len(values) > 1:
-            majority = values.most_common(1)[0][0]
-            for d in connected:
-                if d.get(field) and d.get(field) != majority:
-                    sev = "info" if field == "sw-version" else "low"
-                    _finding(findings, sev, "versions", d.get("hostname") or d.get("serial", ""),
-                             f"{label} differs from fleet majority", f"{d[field]} vs {majority}")
+    versions = Counter(d.get("sw-version", "") for d in connected if d.get("sw-version"))
+    if len(versions) > 1:
+        majority = versions.most_common(1)[0][0]
+        for d in connected:
+            if d.get("sw-version") and d["sw-version"] != majority:
+                _finding(findings, "info", "versions", d.get("hostname") or d.get("serial", ""),
+                         "PAN-OS version differs from fleet majority", f"{d['sw-version']} vs {majority}")
+
+    # Content: compare each firewall with the newest version in use (fleet and Panorama).
+    for field, label in CONTENT_FIELDS:
+        known = [(d, _content(d.get(field))) for d in connected]
+        newest = max([v for _, v in known if v is not None] + [_content(data["panorama"].get(field)) or 0])
+        for d, v in known:
+            if v is not None and v < newest:
+                behind = newest - v
+                severity = "medium" if field == "av-version" and behind >= AV_MAX_AGE_DAYS else "low"
+                detail = f"{d[field]}; newest in use starts {newest}"
+                if field == "av-version":
+                    detail += f" ({behind} releases behind)"
+                _finding(findings, severity, "versions", d.get("hostname") or d.get("serial", ""),
+                         f"{label} is behind the newest in use", detail)
+
+    # Panorama must run the same or a later PAN-OS than every managed firewall.
+    panorama_version = _version(data["panorama"].get("sw-version"))
+    for d in devices if panorama_version else ():
+        fw_version = _version(d.get("sw-version"))
+        if fw_version and fw_version[:2] > panorama_version[:2]:
+            _finding(findings, "high", "versions", d.get("hostname") or d.get("serial", ""),
+                     "Firewall runs a newer PAN-OS feature release than Panorama",
+                     f"{d['sw-version']} vs Panorama {data['panorama']['sw-version']}; Panorama must be the same or later")
+        elif fw_version and fw_version > panorama_version:
+            _finding(findings, "low", "versions", d.get("hostname") or d.get("serial", ""),
+                     "Firewall runs a newer maintenance release than Panorama",
+                     f"{d['sw-version']} vs Panorama {data['panorama']['sw-version']}")
 
     ha = data["panorama_ha"]
     if ha.get("enabled") == "yes":
@@ -1325,13 +1535,32 @@ def evaluate(data):
                 pass
         if row.get("ha_peer_conn") and row["ha_peer_conn"].lower() != "up":
             _finding(findings, "high", "high-availability", name, f"HA peer connection is '{row['ha_peer_conn']}'")
+        for link in ("ha1", "ha2"):
+            status = row.get(f"{link}_status", "")
+            if status and status.lower() != "up":
+                _finding(findings, "high", "high-availability", name, f"{link.upper()} link is '{status}'")
+        if row.get("ha_enabled") == "yes" and row.get("ha_config_sync", "").lower() not in ("", "synchronized"):
+            _finding(findings, "medium", "high-availability", name,
+                     f"HA config is not synchronised with the peer ('{row['ha_config_sync']}')")
+        if row.get("log_forwarding") == "not connected":
+            _finding(findings, "high", "logging", name, "Firewall is not forwarding logs",
+                     "no connection to Panorama or a log collector (show logging-status)")
+        if row.get("log_fwd_lag_min") and int(row["log_fwd_lag_min"]) >= LOG_LAG_MINUTES:
+            _finding(findings, "medium", "logging", name,
+                     f"Log forwarding is {row['log_fwd_lag_min']} minutes behind",
+                     f"last forwarded {row.get('last_log_forwarded', '')} to {row.get('log_destination', '') or '?'}")
+        for kind, label, limit in (("av", "Antivirus", AV_MAX_AGE_DAYS), ("app", "Applications & Threats", APP_MAX_AGE_DAYS)):
+            age = row.get(f"{kind}_age_days", "")
+            if age and int(age) >= limit:
+                _finding(findings, "medium", "versions", name, f"{label} content is {age} days old",
+                         f"released {row.get(f'{kind}_release_date', '')}")
 
     for err in data["errors"]:
         _finding(findings, "medium", "collection", err["section"], "Section could not be collected", err["error"])
     if data.get("unavailable"):
         _finding(findings, "info", "collection", ", ".join(data["unavailable"]),
                  "Not checked: the REST API has no data for these sections",
-                 "These need XML API access (API_MODE=xml)")
+                 "The default run (XML API) collects them")
 
     findings.sort(key=lambda f: SEVERITY_ORDER[f["severity"]])
     return findings
@@ -1357,7 +1586,13 @@ INVENTORY_COLS = ["hostname", "serial", "model", "family", "ip-address", "connec
                   "operational-mode", "unsupported-version", "device-cert-present",
                   "device-cert-expiry-date", "connected-at"]
 FINDING_COLS = ["severity", "area", "target", "finding", "detail"]
-SYNC_COLS = ["type", "group", "hostname", "serial", "connected"]
+SYNC_COLS = ["type", "group", "hostname", "serial", "connected", "status"]
+HA_COLS = ["firewall", "serial", "state", "peer", "peer_serial", "peer_state", "peer_connected", "status",
+           "version_mismatch"]
+FW_STATUS_COLS = ["hostname", "serial", "connected", "sw-version", "app-version", "av-version", "wildfire-version",
+                  "device-group", "policy_sync", "template", "template_sync", "last_commit", "ha_state", "ha_peer",
+                  "ha_pair", "ha_mode", "ha_links", "ha_config_sync", "log_forwarding", "last_log_forwarded",
+                  "av_age_days"]
 JOB_COLS = ["id", "type", "status", "result", "user", "tenq", "tfin", "progress",
             "devices_total", "devices_failed", "failed_devices", "description", "details"]
 RULE_COLS = ["location", "rulebase", "position", "name", "action", "disabled", "from", "to", "source",
@@ -1370,7 +1605,9 @@ SYSLOG_COLS = ["receive_time", "time_generated", "device_name", "serial", "sever
 CONFIGLOG_COLS = ["receive_time", "admin", "client", "cmd", "path", "result", "device_name", "serial"]
 RESOURCE_COLS = ["hostname", "serial", "ha_enabled", "ha_local_state", "ha_peer_state", "ha_peer_conn",
                  "num-active", "num-max", "session_util_pct", "cps", "pps", "kbps",
-                 "mgmt_cpu_pct", "mgmt_mem_pct", "dp_cpu_pct", "packet_buffer_pct", "disk_max_pct", "error"]
+                 "mgmt_cpu_pct", "mgmt_mem_pct", "dp_cpu_pct", "packet_buffer_pct", "disk_max_pct",
+                 "ha_mode", "ha1_status", "ha2_status", "ha_config_sync", "log_forwarding", "log_destination",
+                 "last_log_forwarded", "log_fwd_lag_min", "av_release_date", "av_age_days", "error"]
 DISK_COLS = ["device", "serial", "mount", "use_pct", "size", "used", "avail", "filesystem"]
 CERT_COLS = ["location", "name", "days_left", "not-valid-after", "common-name", "issuer", "subject",
              "not-valid-before", "algorithm", "ca", "has-private-key", "expiry-epoch"]
@@ -1415,6 +1652,10 @@ def csv_tables(data, findings):
         "config_logs.csv": (data["config_logs"], CONFIGLOG_COLS),
         "collection_errors.csv": (data["errors"], ["section", "error"]),
     }
+    if any("connected" in d for d in data["devices"]):  # XML inventory; REST has no HA data
+        tables["ha_pairs.csv"] = (ha_pairs(data["devices"]), HA_COLS)
+        tables["firewall_status.csv"] = (firewall_status(data["devices"], data["sync"], data["resources"]),
+                                         FW_STATUS_COLS)
     if data["resources"]:
         tables["firewall_resources.csv"] = (data["resources"], RESOURCE_COLS)
     if data["disk"]:
@@ -1470,6 +1711,35 @@ details summary { cursor:pointer; color:var(--muted); margin-top:8px; }
 """
 
 
+def sync_html(rows):
+    counts = Counter((r["type"], r.get("status", "unknown")) for r in rows)
+    summary = ", ".join(f"{kind} {status}: {n}" for (kind, status), n in sorted(counts.items()))
+    order = {"Out of Sync": 0, "Commit failed": 1, "unknown": 2, "In Sync": 3}
+    rows = sorted(rows, key=lambda r: (order.get(r.get("status"), 2), r["type"], r["group"]))
+    head = f'<p class="meta">{html.escape(summary)}</p>' if summary else ""
+    return head + _table(rows, columns_for(rows, SYNC_COLS))
+
+
+def fw_status_html(data):
+    rows = firewall_status(data["devices"], data["sync"], data["resources"])
+    note = ("" if data["resources"] else '<p class="meta">HA mode, HA links, HA config sync and log forwarding '
+            "come from the per-firewall checks (--targeted).</p>")
+    return note + _table(rows, columns_for(rows, FW_STATUS_COLS, include_extra=False))
+
+
+def ha_html(data):
+    ha = data["panorama_ha"]
+    pano = ""
+    if ha:
+        pano = _table([{"Panorama HA": ha.get("enabled", ""), "local state": _ends(ha, "local-info/state"),
+                        "peer state": _ends(ha, "peer-info/state"),
+                        "peer connection": _ends(ha, "peer-info/conn-status"),
+                        "running config": _ends(ha, "running-sync")}],
+                      ["Panorama HA", "local state", "peer state", "peer connection", "running config"])
+    pairs = ha_pairs(data["devices"])
+    return pano + "<h3>Firewall HA pairs</h3>" + _table(pairs, HA_COLS, "No firewalls report an HA peer.")
+
+
 def write_html(path, data, findings, settings, calls, started):
     devices = data["devices"]
     sev = Counter(f["severity"] for f in findings)
@@ -1502,7 +1772,8 @@ def write_html(path, data, findings, settings, calls, started):
         if value:
             pano_rows.append({"field": label, "value": value})
 
-    status_cols = sorted({k for d in devices for k in d if "policy-status" in k or "template-status" in k})
+    status_cols = sorted({k for d in devices for k in d
+                          if "policy-status" in k or "template-status" in k or "last-commit-all" in k})
     inv_cols = columns_for(devices, INVENTORY_COLS[:2] + ["device-group", "template-stack"]
                            + INVENTORY_COLS[2:16] + status_cols, include_extra=False)
     unavailable = set(data.get("unavailable", []))
@@ -1520,7 +1791,11 @@ def write_html(path, data, findings, settings, calls, started):
         ("findings", "Health findings", _table(findings, FINDING_COLS, "No findings."), None),
         ("panorama", "Panorama", _table(pano_rows, ["field", "value"]), "panorama"),
         ("inventory", inventory_title, _table(devices, inv_cols), "devices"),
-        ("sync", "Device-group & template sync", _table(data["sync"], columns_for(data["sync"], SYNC_COLS)), "sync"),
+        ("fwstatus", "Firewall status (versions, sync, HA, logging)", fw_status_html(data),
+         "devices" if any("connected" in d for d in devices) else "sync"),
+        ("sync", "Sync status (device groups & templates)", sync_html(data["sync"]), "sync"),
+        # XML inventory only: REST device data has no HA fields.
+        ("ha", "High availability", ha_html(data), "devices" if any("connected" in d for d in devices) else "sync"),
         ("jobs", f"Recent Panorama jobs (last {settings.max_jobs})",
          _table(data["jobs"], columns_for(data["jobs"], JOB_COLS[:12], include_extra=False)), "jobs"),
         ("collectors", "Log collectors", _table(data["log_collectors"],
@@ -1540,8 +1815,8 @@ def write_html(path, data, findings, settings, calls, started):
     if unavailable:
         items = "".join(f"<li>{html.escape(n)}</li>" for n in SECTIONS if n in unavailable)
         sections.append(("not-collected", "Not collected",
-                         "<p>The REST API has no endpoints for these sections; they need XML API access "
-                         f"(API_MODE=xml):</p><ul>{items}</ul>"))
+                         "<p>The REST API has no endpoints for these sections; the default run, which uses "
+                         f"the XML API, collects them:</p><ul>{items}</ul>"))
     if data["resources"]:
         sections.append(("resources", "Per-firewall live status (HA, sessions, CPU, memory)",
                          _table(data["resources"], columns_for(data["resources"], RESOURCE_COLS))))
@@ -1583,12 +1858,12 @@ REST_CHECKS = [
 ]
 
 
-def diagnose(client):
-    print(f"Diagnosing {client.settings.api_mode.upper()} API access to {client.settings.host} (read-only checks)")
-    print(f"Using {client.settings.key_label()}\n")
-    if client.settings.api_mode == "rest":
-        return diagnose_rest(client)
-    return diagnose_xml(client)
+def diagnose(client, mode=None):
+    """Check API access: the XML API by default, the REST API when mode='rest' (menu only)."""
+    s = replace(client.settings, api_mode=mode or client.settings.api_mode)
+    print(f"Diagnosing {s.api_mode.upper()} API access to {s.host} (read-only checks)")
+    print(f"Using {s.key_label()}\n")
+    return diagnose_rest(client) if s.api_mode == "rest" else diagnose_xml(client)
 
 
 def diagnose_rest(client):
@@ -1613,7 +1888,7 @@ def diagnose_rest(client):
         print(f"  FAIL  Panorama/DeviceGroups or TemplateStacks\n        {exc}")
 
     print("\nThe REST API covers configuration only: inventory by device group, and security rules.")
-    print("Connectivity, HA, sync, jobs and logs are not available through REST.")
+    print("Connectivity, HA, sync, jobs and logs come from the XML API, which every default run uses.")
     print("\nAll checks passed." if ok else "\nSome checks failed; the report will include what passed.")
     return 0 if ok else 1
 
@@ -1679,8 +1954,8 @@ def compare_key_methods(client):
         print(f"       KEY_IN_HEADER={'true' if best['key_in_header'] else 'false'}")
         print(f"       HTTP_METHOD={best['http_method']}")
     else:
-        print("\n  -> Every method was denied: the role has no XML API access. If your key works with")
-        print("     the REST API (/restapi/...), set API_MODE=rest in .env.")
+        print("\n  -> Every method was denied: the role has no XML API access. Check that PANORAMA_XML_API_KEY")
+        print("     is the XML key, and enable Panorama > Admin Roles > <role> > XML API.")
 
 
 # --------------------------------------------------------------------------
@@ -2121,20 +2396,13 @@ class MenuApp:
 
     # ---- inventory that populates the menus (cached; refresh on request) ----
 
-    @property
-    def xml(self):
-        return self.settings.api_mode == "xml"
-
     def load_inventory(self, force=False):
         if self.cache is not None and not force:
             return
         self.cache, self.cache_errors = {"devices": [], "groups": [], "templates": []}, {}
         self.tui.write(self.tui.s("  Loading inventory from Panorama (read-only)...", "2"))
-        if self.xml:
-            fetches = [("devices", self._xml_devices), ("groups", lambda: self._xml_groups("devicegroups")),
-                       ("templates", lambda: self._xml_groups("templates"))]
-        else:
-            fetches = [("groups", self._rest_groups)]
+        fetches = [("devices", self._xml_devices), ("groups", lambda: self._xml_groups("devicegroups")),
+                   ("templates", lambda: self._xml_groups("templates"))]
         for key, fetch in fetches:
             try:
                 self.cache[key] = fetch()
@@ -2160,23 +2428,24 @@ class MenuApp:
                                     f"config get {node} names")
         return [(e.get("name"), None) for e in top_entries(names) if e.get("name")]
 
-    def _rest_groups(self):
-        entries = Collector(self.client, self.settings)._rest_device_groups()
-        return [(e.get("@name"), json_to_element("entry", e)) for e in entries if e.get("@name")]
-
     def group_names(self):
         return [name for name, _ in self.cache["groups"]]
+
+    def cached_sync_rows(self):
+        return [row for kind, sync_kind in (("groups", "device-group"), ("templates", "template"))
+                for _, el in self.cache[kind] if el is not None for row in Collector._sync_rows(sync_kind, [el])]
 
     def connected(self):
         return [d for d in self.cache["devices"] if d.get("connected") == "yes"]
 
-    def mode_sections(self):
-        return list(SECTIONS if self.xml else REST_SECTIONS)
+    @staticmethod
+    def mode_sections():
+        return list(SECTIONS)
 
     def estimate(self, sections, groups=None, templates=None, firewalls=0):
         groups = len(self.cache["groups"]) if groups is None else groups
         templates = len(self.cache["templates"]) if templates is None else templates
-        return estimate_calls(self.settings.api_mode, sections, groups, templates, firewalls)
+        return estimate_calls("xml", sections, groups, templates, firewalls)
 
     # ---- layout ----
 
@@ -2186,7 +2455,7 @@ class MenuApp:
         rule = t.s(t.g["rule"] * min(t.width, 96), "2")
         key = f"key ...{s.api_key[-4:]}" if s.api_key else t.s("no key", "31")
         lines = [rule, " " + t.s("PANORAMA HEALTH CHECK", "1;36") + t.s("   read-only", "2"),
-                 " " + dot.join([s.host, f"{s.api_mode.upper()} API", key])]
+                 " " + dot.join([s.host, "XML API", key])]
         if self.cache is not None:
             parts = []
             if self.cache["devices"]:
@@ -2194,8 +2463,7 @@ class MenuApp:
                 parts.append(f"{len(self.cache['devices'])} firewalls "
                              + (t.s(f"({down} not connected)", "31") if down else t.s("(all connected)", "32")))
             parts.append(f"{len(self.cache['groups'])} device groups")
-            if self.xml:
-                parts.append(f"{len(self.cache['templates'])} templates")
+            parts.append(f"{len(self.cache['templates'])} templates")
             lines.append(" " + dot.join(parts))
             if self.cache_errors:
                 lines.append(" " + t.s(f"Could not read: {', '.join(self.cache_errors)} (see Diagnose)", "33"))
@@ -2227,7 +2495,7 @@ class MenuApp:
             pass
         actions = {"1": self.full_check, "2": self.quick_check, "3": self.custom_check, "4": self.browse,
                    "5": self.run_diagnose, "6": self.preview, "7": self.reports, "8": self.settings_menu,
-                   "r": lambda: self.load_inventory(force=True)}
+                   "9": self.rest_menu, "r": lambda: self.load_inventory(force=True)}
         while True:
             try:
                 choice = self.tui.select("Main menu", self.main_items())
@@ -2244,8 +2512,6 @@ class MenuApp:
         dot = f" {self.tui.g['dot']} "
         reports = self._report_dirs()
         devices = self.cache["devices"]
-        browse_hint = (f"{len(devices)} firewalls, {groups} device groups, jobs, Panorama status" if self.xml
-                       else "needs API_MODE=xml (operational data)")
         s = self.settings
         return [
             MenuItem("1", "Full health check",
@@ -2254,14 +2520,18 @@ class MenuApp:
                      dot.join([f"shared + first {QUICK_DEVICE_GROUPS} device groups",
                                f"~{self.estimate(full, min(groups, QUICK_DEVICE_GROUPS), min(templates, QUICK_DEVICE_GROUPS))} calls"])),
             MenuItem("3", "Custom health check...", "choose sections, device groups, firewalls and formats"),
-            MenuItem("4", "Browse Panorama (live)", browse_hint, disabled=not self.xml),
+            MenuItem("4", "Browse Panorama (live)",
+                     f"{len(devices)} firewalls, {groups} device groups, HA & sync, jobs, Panorama status"),
             MenuItem("5", "Diagnose API access", "test each permission and how the key is sent"),
             MenuItem("6", "Preview API calls", "dry run of a full check; sends nothing"),
             MenuItem("7", "Past reports", f"{len(reports)} in {s.output_dir}"),
             MenuItem("8", "Session settings",
-                     dot.join([f"{s.api_mode} mode", f"delay {s.request_delay:g}s", f"logs {s.log_window_hours}h",
+                     dot.join([f"delay {s.request_delay:g}s", f"logs {s.log_window_hours}h",
                                ",".join(self.formats)])),
-            MenuItem("r", "Refresh inventory", f"re-read firewalls and groups ({'3' if self.xml else '1'}+ calls)"),
+            MenuItem("9", "REST API (optional)",
+                     "security rules and membership via REST; never used otherwise" if s.rest_api_key
+                     else f"{API_KEY_VARS['rest']} is empty in .env", disabled=not s.rest_api_key),
+            MenuItem("r", "Refresh inventory", "re-read firewalls and groups (3 calls)"),
             MenuItem("q", "Quit"),
         ]
 
@@ -2277,7 +2547,7 @@ class MenuApp:
     def preview(self):
         self.execute("Preview: full health check", [s for s in self.mode_sections() if s != "targeted"], dry=True)
 
-    def execute(self, title, sections, dry=False, **scope):
+    def execute(self, title, sections, dry=False, settings=None, **scope):
         self.tui.screen(title + (" (dry run, nothing is sent)" if dry else ""))
         if not dry:
             self.tui.message("Ctrl+C cancels.", "2")
@@ -2285,7 +2555,8 @@ class MenuApp:
                                 log=self.tui.write) if dry else self.client
         started = time.monotonic()
         first = len(client.calls)
-        data, findings, out_dir = run_health_check(client, self.settings, sections, self.formats, **scope)
+        data, findings, out_dir = run_health_check(client, settings or self.settings, sections, self.formats,
+                                                   **scope)
         calls = len(client.calls) - first
         if dry:
             self.tui.write(f"\n  Preview complete: {calls} calls listed, nothing sent.")
@@ -2428,10 +2699,33 @@ class MenuApp:
         finally:
             self.formats = saved
 
-    def run_diagnose(self):
-        self.tui.screen("Diagnose API access")
-        diagnose(self.client)
+    def run_diagnose(self, mode=None):
+        self.tui.screen(f"Diagnose {(mode or 'xml').upper()} API access")
+        diagnose(self.client, mode)
         self.tui.pause()
+
+    # ---- REST API: only ever used from here ----
+
+    def rest_menu(self):
+        t = self.tui
+        intro = [f"  {t.s('Using', '2')} {replace(self.settings, api_mode='rest').key_label()}",
+                 "  " + t.s("Every other check uses the XML API only. Nothing here runs unless you pick it.", "2")]
+        while True:
+            estimate = estimate_calls("rest", REST_SECTIONS, len(self.cache["groups"]))
+            choice = t.select("REST API (optional, GET only)", [
+                MenuItem("r", "Security rules and membership via REST",
+                         f"~{estimate} REST GET calls; device groups, template stacks, pre/post rules"),
+                MenuItem("p", "Preview the REST calls", "dry run; sends nothing"),
+                MenuItem("d", "Diagnose REST API access", "Policies, Panorama/DeviceGroups, TemplateStacks"),
+                MenuItem("b", "Back")], intro=intro)
+            if choice in (None, "b"):
+                return
+            if choice == "d":
+                self._safe(self.run_diagnose, "rest")
+            else:
+                # A per-run copy: the REST setting never outlives this run, and session limits still apply.
+                self._safe(self.execute, "REST API: security rules and membership", list(REST_SECTIONS),
+                           choice == "p", replace(self.settings, api_mode="rest"))
 
     # ---- browse (live, read-only) ----
 
@@ -2444,6 +2738,7 @@ class MenuApp:
                          style="31" if down else ""),
                 MenuItem("g", f"Device groups ({len(self.cache['groups'])})", "members and policy sync; collect rules"),
                 MenuItem("t", f"Templates ({len(self.cache['templates'])})", "members and template sync"),
+                MenuItem("h", "HA & sync overview", "HA pairs, out-of-sync firewalls (no extra calls)"),
                 MenuItem("j", "Recent jobs", f"last {self.settings.max_jobs} commit/push jobs (1 call)"),
                 MenuItem("l", "Log collectors", "connectivity (1 call)"),
                 MenuItem("p", "Panorama status", "version, HA, CPU, memory, disk, NTP (5 calls)"),
@@ -2454,7 +2749,8 @@ class MenuApp:
             if choice in (None, "b"):
                 return
             action = {"f": self.browse_firewalls, "g": lambda: self.browse_groups("groups"),
-                      "t": lambda: self.browse_groups("templates"), "j": self.browse_jobs,
+                      "t": lambda: self.browse_groups("templates"), "h": self.ha_sync_overview,
+                      "j": self.browse_jobs,
                       "l": self.browse_collectors, "p": self.panorama_status,
                       "r": lambda: self.load_inventory(force=True)}[choice]
             self._safe(action)
@@ -2466,8 +2762,17 @@ class MenuApp:
             t.message(self.cache_errors.get("devices", "No firewalls found."))
             t.pause()
             return
-        cols = ["hostname", "serial", "model", "ip-address", "connected", "sw-version", "ha/state"]
-        head, items = t.table_items(devices, cols, style=lambda d: "" if d.get("connected") == "yes" else "31")
+        rows = firewall_status(devices, self.cached_sync_rows())
+        cols = ["hostname", "serial", "connected", "sw-version", "av-version", "policy_sync", "template_sync",
+                "ha_state", "ha_pair"]
+
+        def style(row):
+            if row["connected"] != "yes":
+                return "31"
+            bad = ("Out of Sync", "Commit failed")
+            return "33" if row["policy_sync"] in bad or row["template_sync"] in bad or row["ha_pair"] not in ("", "ok") else ""
+
+        head, items = t.table_items(rows, cols, style=style)
         while True:
             choice = t.select(f"Firewalls ({len(devices)})", items, head=head, filterable=True, show_keys=False)
             if choice is None:
@@ -2482,9 +2787,20 @@ class MenuApp:
         pad = min(40, max(len(c) for c in fields)) if fields else 0
         intro = [f"  {t.s(f'{c:<{pad}}', '2')}  {t.s(dev[c], '31' if c == 'connected' and dev[c] != 'yes' else '')}"
                  for c in fields]
+        status = next((r for r in firewall_status(self.cache["devices"], self.cached_sync_rows())
+                       if r["serial"] == dev.get("serial")), {})
+        status_lines = [(label, status.get(key, "")) for key, label in (
+            ("device-group", "Device group"), ("policy_sync", "Policy sync"), ("template", "Template"),
+            ("template_sync", "Template sync"), ("last_commit", "Last commit-all"), ("ha_peer", "HA peer"),
+            ("ha_pair", "HA pair"))]
+        intro += ["", "  " + t.s("Sync and HA", "1")]
+        intro += [f"  {t.s(f'{label:<{max(pad, 16)}}', '2')}  "
+                  + t.s(value or "-", "33" if value in ("Out of Sync", "Commit failed") else "")
+                  for label, value in status_lines]
+        # Evaluate with the whole fleet (HA peers, newest content) and keep this firewall's findings.
         data = Collector(None, self.settings).data
-        data["devices"] = [dev]
-        found = evaluate(data)
+        data["devices"] = self.cache["devices"]
+        found = [f for f in evaluate(data) if name in f["target"].split(" / ")]
         if found:
             intro += ["", "  " + t.s("Findings", "1")]
             intro += ["  " + t.s(f"{f['severity']:<9}", SEV_STYLE[f["severity"]]) + f["finding"] for f in found]
@@ -2514,12 +2830,23 @@ class MenuApp:
         data["resources"], data["disk"] = collector.data["resources"], collector.data["disk"]
         row = data["resources"][0] if data["resources"] else {}
         limits = {f: limit for f, _, limit in LOAD_LIMITS}
-        labels = [("ha_enabled", "HA enabled"), ("ha_local_state", "HA local state"),
+        labels = [("ha_enabled", "HA enabled"), ("ha_mode", "HA mode"), ("ha_local_state", "HA local state"),
                   ("ha_peer_state", "HA peer state"), ("ha_peer_conn", "HA peer connection"),
+                  ("ha1_status", "HA1 link"), ("ha2_status", "HA2 link"), ("ha_config_sync", "HA config sync"),
+                  ("ha_state_sync", "HA state sync"), ("ha_priority", "HA priority"),
+                  ("ha_preemptive", "HA preemptive"), ("ha_link_monitoring", "Link monitoring"),
+                  ("ha_path_monitoring", "Path monitoring"),
+                  ("log_forwarding", "Log forwarding"), ("log_destination", "Logs sent to"),
+                  ("last_log_forwarded", "Last log forwarded"), ("log_fwd_lag_min", "Forwarding lag (min)"),
+                  ("av_release_date", "Antivirus released"), ("av_age_days", "Antivirus age (days)"),
+                  ("app_release_date", "Apps & Threats released"), ("app_age_days", "Apps & Threats age (days)"),
                   ("num-active", "Active sessions"), ("num-max", "Session capacity"),
                   ("session_util_pct", "Session table %"), ("cps", "Connections/s"), ("kbps", "Throughput kbps"),
                   ("mgmt_cpu_pct", "Management CPU %"), ("mgmt_mem_pct", "Management memory %"),
                   ("dp_cpu_pct", "Dataplane CPU %"), ("packet_buffer_pct", "Packet buffer %")]
+        limits.update({"log_fwd_lag_min": LOG_LAG_MINUTES, "av_age_days": AV_MAX_AGE_DAYS,
+                       "app_age_days": APP_MAX_AGE_DAYS})
+        bad_values = {"down", "not connected", "unknown"}
         lines = []
         for field_name, label in labels:
             value = row.get(field_name, "")
@@ -2529,7 +2856,9 @@ class MenuApp:
                     style = "1;31" if float(value) >= limits[field_name] else "32"
             except ValueError:
                 pass
-            lines.append(f"  {t.s(f'{label:<22}', '2')} {t.s(value or '-', style)}")
+            if value.lower() in bad_values:
+                style = "1;31"
+            lines.append(f"  {t.s(f'{label:<26}', '2')} {t.s(value or '-', style)}")
         if data["disk"]:
             lines += ["", "  " + t.s("Disk", "1")]
             lines += t.table_lines(data["disk"], ["mount", "use_pct", "size", "used", "avail"],
@@ -2593,6 +2922,31 @@ class MenuApp:
                 t.view(f"Members of {row['name']}", member_lines)
             else:
                 self.execute(f"Security rules: {row['name']}", ["rules"], only_groups=[row["name"]], max_groups=1)
+
+    def ha_sync_overview(self):
+        t = self.tui
+        pairs = ha_pairs(self.cache["devices"])
+        sync = self.cached_sync_rows()
+        lines = ["  " + t.s("Firewall HA pairs", "1")]
+        if pairs:
+            lines += t.table_lines(pairs, ["firewall", "state", "peer", "peer_state", "peer_connected", "status",
+                                           "version_mismatch"],
+                                   lambda r: SEV_STYLE.get(HA_PAIR_SEVERITY.get(r["status"], ""), "")
+                                   or ("32" if r["status"] == "ok" else "33"))
+        else:
+            lines.append("  " + t.s("No firewalls report an HA peer.", "2"))
+        counts = Counter(r["status"] for r in sync)
+        lines += ["", "  " + t.s("Sync status", "1") + "   " + "   ".join(
+            t.s(f"{status} {n}", "32" if status == "In Sync" else "33") for status, n in sorted(counts.items()))]
+        problems = [r for r in sync if r["status"] != "In Sync"]
+        if problems:
+            lines += t.table_lines(problems, ["type", "group", "hostname", "serial", "connected", "status"],
+                                   lambda r: "31" if r["status"] in ("Out of Sync", "Commit failed") else "2")
+        elif sync:
+            lines.append("  " + t.s("Every firewall is in sync.", "32"))
+        else:
+            lines.append("  " + t.s(self.cache_errors.get("groups", "No sync data."), "2"))
+        t.view("HA & sync overview", lines)
 
     def browse_jobs(self):
         t = self.tui
@@ -2687,12 +3041,15 @@ class MenuApp:
                          "html": "yes" if (path / "report.html").exists() else "no"})
         head, items = t.table_items(rows, ["when", "firewalls", "critical", "high", "medium", "low", "html"],
                                     style=lambda r: "31" if r["critical"] else ("38;5;208" if r["high"] else ""))
-        while True:
-            choice = t.select(f"Past reports ({len(rows)}, newest first)", items, head=head, filterable=True,
-                              show_keys=False)
-            if choice is None:
-                return
+        items.append(MenuItem("x", f"Clear all reports ({len(self._report_dirs())} folders)",
+                              f"deletes every report folder in {self.settings.output_dir}", style="31"))
+        choice = t.select(f"Past reports ({len(rows)}, newest first)", items, head=head, filterable=True,
+                          show_keys=False)
+        if choice == "x":
+            self.clear_reports()
+        elif choice is not None:
             self.report_actions(runs[int(choice) - 1])
+            self.reports()  # re-list: the report may have been deleted
 
     def report_actions(self, path):
         t = self.tui
@@ -2704,6 +3061,7 @@ class MenuApp:
                          disabled=not html_path.exists()),
                 MenuItem("f", f"View findings ({len(findings)})"),
                 MenuItem("d", "Open report folder", str(path)),
+                MenuItem("x", "Delete this report", "asks first", style="31"),
                 MenuItem("b", "Back")])
             if choice in (None, "b"):
                 return
@@ -2711,20 +3069,51 @@ class MenuApp:
                 _open_path(html_path)
             elif choice == "f":
                 t.view(f"Findings {path.name}", t.table_lines(findings, FINDING_COLS, self._sev_style))
+            elif choice == "x":
+                if self._delete_reports([path], f"report {path.name}"):
+                    return
             else:
                 _open_path(path)
+
+    def clear_reports(self):
+        runs = self._report_dirs()
+        if runs:
+            self._delete_reports(runs, f"all {len(runs)} report folders in {self.settings.output_dir}")
+
+    def _delete_reports(self, paths, what):
+        """Delete report folders after a typed confirmation. Only timestamped folders in OUTPUT_DIR qualify."""
+        t = self.tui
+        root = self.settings.output_dir.resolve()
+        paths = [p for p in paths if p.parent.resolve() == root and REPORT_DIR_RE.fullmatch(p.name)
+                 and p.is_dir() and not p.is_symlink()]
+        if not paths:
+            return False
+        t.write()
+        t.message(f"This permanently deletes {what}.", "1;31")
+        if t.prompt("Type DELETE to confirm, anything else cancels") != "DELETE":
+            t.message("Cancelled; nothing was deleted.")
+            t.pause()
+            return False
+        failed = []
+        for path in paths:
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                failed.append(f"{path.name}: {exc.strerror or exc}")
+        t.message(f"Deleted {len(paths) - len(failed)} report folder(s).", "32")
+        for line in failed:
+            t.message(f"Could not delete {line}", "31")
+        if self.last_run and not self._report_dirs():
+            self.last_run = ""
+        t.pause()
+        return True
 
     # ---- session settings ----
 
     def settings_menu(self):
         t, s, env = self.tui, self.settings, self.env
         while True:
-            other = "rest" if self.xml else "xml"
-            other_key = getattr(s, f"{other}_api_key")
             items = [
-                MenuItem("m", f"API mode: {s.api_mode}",
-                         f"switch to {other}" if other_key else f"{API_KEY_VARS[other]} is empty in .env",
-                         disabled=not other_key),
                 MenuItem("f", f"Report formats: {', '.join(self.formats)}"),
                 MenuItem("d", f"Request delay: {s.request_delay:g}s", f"minimum {env.request_delay:g}s from .env"),
                 MenuItem("w", f"Log window: {s.log_window_hours}h", "1-168 hours"),
@@ -2737,10 +3126,7 @@ class MenuApp:
             choice = t.select("Session settings (this session only; edit .env to keep them)", items)
             if choice in (None, "b"):
                 return
-            if choice == "m":
-                s.api_mode = other
-                self.load_inventory(force=True)
-            elif choice == "f":
+            if choice == "f":
                 picked = t.checklist("Report formats", [MenuItem("html", "HTML report"), MenuItem("csv", "CSV files")],
                                      selected=self.formats)
                 if picked:
@@ -2846,6 +3232,9 @@ def main(argv=None, transport=None):
         return 2
     if args.output_dir:
         settings.output_dir = Path(args.output_dir)
+    if load_env_file(args.env).get("API_MODE", "").strip().lower() == "rest":
+        print("Note: API_MODE in .env is no longer used. Every run uses the XML API; the REST API is only an "
+              "option in the menu (python pano_healthcheck.py, option 9).", file=sys.stderr)
 
     if args.menu and (args.dry_run or args.diagnose):
         # The menu talks to Panorama as soon as it opens; never let it run when asked for a dry run.
