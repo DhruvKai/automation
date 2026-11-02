@@ -23,7 +23,9 @@ This repo is a **read-only** Palo Alto Panorama health-check collector. It is us
    - Do not add production hosts.
    - Development and testing happen against the lab Panorama only.
 4. **Secrets.**
-   - Never print, log, write to reports or commit the API key.
+   - Never print, log, write to reports or commit the API keys.
+   - XML and REST have separate keys (`PANORAMA_XML_API_KEY`, `PANORAMA_REST_API_KEY`; `PANORAMA_API_KEY` is the fallback). `request()` sends only the XML key and `rest_get()` only the REST key; never mix them.
+   - Certificate config entries contain private keys: read only named fields (`certificate_row()`), never `flatten()` them into a report.
    - `.env` is git-ignored; keep it that way.
    - The key goes in the `X-PAN-KEY` header, or in the POST body (XML only). Never put it in URLs; `load_settings()` rejects `HTTP_METHOD=GET` with `KEY_IN_HEADER=false`.
 5. **Low load.**

@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -94,6 +95,42 @@ MiB Mem :   8000.0 total,   1000.0 free,   6000.0 used,   1000.0 buff/cache
 SESSION_INFO = """<response status="success"><result><num-max>100000</num-max><num-active>85000</num-active>
 <cps>120</cps></result></response>"""
 
+DISK_SPACE = """<response status="success"><result><![CDATA[Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       6.9G  6.3G  0.3G  95% /
+none            2.0G   40K  2.0G   1% /dev
+/dev/sda5        16G  9.6G  5.2G  65% /opt/pancfg
+/dev/sda8       200G  196G  4.0G  98% /opt/panlogs
+]]></result></response>"""
+
+NTP = """<response status="success"><result><synched>LOCAL</synched>
+<ntp-server-1><status>rejected</status><authentication-type>none</authentication-type><reachable>no</reachable>
+<name>192.0.2.123</name></ntp-server-1></result></response>"""
+
+DP_RESOURCES = """<response status="success"><result><resource-monitor><data-processors><dp0><minute>
+<cpu-load-average><entry><coreid>0</coreid><value>0</value></entry><entry><coreid>1</coreid><value>90</value></entry>
+<entry><coreid>2</coreid><value>94</value></entry></cpu-load-average>
+<resource-utilization><entry><name>session</name><value>3</value></entry>
+<entry><name>packet buffer</name><value>12</value></entry><entry><name>packet descriptor</name><value>5</value></entry>
+</resource-utilization></minute></dp0></data-processors></resource-monitor></result></response>"""
+
+HA_DEGRADED = """<response status="success"><result><enabled>yes</enabled><group><mode>Active-Passive</mode>
+<local-info><state>primary-suspended</state></local-info><peer-info><conn-status>down</conn-status>
+<state>secondary-active</state></peer-info><running-sync>not synchronized</running-sync>
+<running-sync-enabled>yes</running-sync-enabled></group></result></response>"""
+
+SHARED_CERTS = """<response status="success"><result total-count="1" count="1"><certificate>
+<entry name="old-ca"><common-name>Lab CA</common-name><issuer>Lab CA</issuer>
+ <not-valid-after>Jan  1 00:00:00 2020 GMT</not-valid-after><expiry-epoch>1577836800</expiry-epoch><ca>yes</ca>
+ <algorithm>RSA</algorithm><private-key>-----BEGIN ENCRYPTED PRIVATE KEY-----PRIVATEBLOB</private-key>
+ <public-key>PUBLICBLOB</public-key></entry>
+<entry name="pano-web"><common-name>pano.lab</common-name><not-valid-after>Jan  1 00:00:00 2099 GMT</not-valid-after>
+ </entry>
+</certificate></result></response>"""
+
+TEMPLATE_CERTS = f"""<response status="success"><result total-count="1" count="1"><certificate>
+<entry name="gp-portal"><common-name>vpn.lab</common-name><expiry-epoch>{int(time.time()) + 10 * 86400 + 3600}</expiry-epoch>
+ <private-key>PRIVATEBLOB</private-key></entry></certificate></result></response>"""
+
 
 REST_DEVICE_GROUPS = {"@status": "success", "@code": "19", "result": {"@count": "1", "entry": [
     {"@name": "DG-Branch", "devices": {"entry": [{"@name": "001"}, {"@name": "002"}]}},
@@ -151,11 +188,16 @@ class FakePanorama:
                 "system_info": SYSTEM_INFO, "ha_state": HA_STATE, "devices_all": DEVICES_ALL,
                 "devicegroups": DEVICEGROUPS, "templates": TEMPLATES, "jobs_all": JOBS,
                 "log_collectors": LOG_COLLECTORS, "session_info": SESSION_INFO,
-                "system_resources": TOP_TEXT,
+                "system_resources": TOP_TEXT, "disk_space": DISK_SPACE, "ntp": NTP,
+                "dp_resources": DP_RESOURCES,
             }[name].encode()
         if t == "config":
             if params["xpath"].endswith("/device-group/entry/@name"):
                 return DG_NAMES.encode()
+            if params["xpath"] == "/config/shared/certificate":
+                return SHARED_CERTS.encode()
+            if "TPL-Branch" in params["xpath"] and params["xpath"].endswith("/certificate"):
+                return TEMPLATE_CERTS.encode()
             if "DG-Branch" in params["xpath"] and "pre-rulebase" in params["xpath"]:
                 return RULES_DG.encode()
             return NOT_PRESENT.encode()
@@ -168,7 +210,8 @@ class FakePanorama:
 
 def make_settings(**overrides):
     values = dict(
-        host=LAB_HOST, port=443, api_key="SECRET-KEY", allowed_hosts=[LAB_HOST], verify_tls=False,
+        host=LAB_HOST, port=443, xml_api_key="SECRET-KEY", rest_api_key="REST-KEY", allowed_hosts=[LAB_HOST],
+        verify_tls=False,
         ca_bundle="", bypass_proxy=True, key_in_header=True, request_delay=0, timeout=5,
         log_window_hours=24, max_logs=100, max_jobs=50, enable_targeted=False, max_targeted=5,
         output_dir=Path(tempfile.gettempdir()),
@@ -216,6 +259,7 @@ class GuardTests(unittest.TestCase):
 
     def test_target_only_on_targeted_commands(self):
         ph.guard({"type": "op", "cmd": ph.OP_COMMANDS["session_info"], "target": "0079010001"})
+        ph.guard({"type": "op", "cmd": ph.OP_COMMANDS["dp_resources"], "target": "0079010001"})
         with self.assertRaises(ph.ReadOnlyViolation):
             ph.guard({"type": "op", "cmd": ph.OP_COMMANDS["devices_all"], "target": "0079010001"})
         with self.assertRaises(ph.ReadOnlyViolation):
@@ -292,6 +336,28 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ph.ConfigError):
             ph.load_settings(path, environ={})
 
+    def test_separate_xml_and_rest_keys(self):
+        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=old\n"
+                         "PANORAMA_XML_API_KEY=xml-key\nPANORAMA_REST_API_KEY=rest-key\nAPI_MODE=xml\n")
+        settings = ph.load_settings(path, environ={})
+        self.assertEqual((settings.xml_api_key, settings.rest_api_key), ("xml-key", "rest-key"))
+        self.assertEqual(settings.api_key, "xml-key")
+        self.assertIn("PANORAMA_XML_API_KEY", settings.key_label())
+        self.assertNotIn("xml-key", settings.key_label())
+
+    def test_legacy_key_is_fallback_for_both(self):
+        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=old\n"
+                         "PANORAMA_REST_API_KEY=rest-key\n")
+        settings = ph.load_settings(path, environ={})
+        self.assertEqual((settings.xml_api_key, settings.rest_api_key), ("old", "rest-key"))
+
+    def test_key_for_current_mode_is_required(self):
+        path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_REST_API_KEY=k\n"
+                         "API_MODE=xml\n")
+        with self.assertRaises(ph.ConfigError) as ctx:
+            ph.load_settings(path, environ={})
+        self.assertIn("PANORAMA_XML_API_KEY", str(ctx.exception))
+
     def test_rest_is_default_mode(self):
         path = self._env("PANORAMA_HOST=192.0.2.10\nALLOWED_HOSTS=192.0.2.10\nPANORAMA_API_KEY=k\n")
         settings = ph.load_settings(path, environ={})
@@ -306,6 +372,21 @@ class ClientTests(unittest.TestCase):
         params, headers = fake.sent[0]
         self.assertEqual(headers["X-PAN-KEY"], "SECRET-KEY")
         self.assertNotIn("key", params)
+
+    def test_each_api_uses_its_own_key(self):
+        fake = FakePanorama()
+        client = ph.PanoramaClient(make_settings(), transport=fake, log=lambda *_: None)
+        client.op("system_info")
+        client.rest_get("Panorama/DeviceGroups", {})
+        self.assertEqual([h["X-PAN-KEY"] for _, h in fake.sent], ["SECRET-KEY", "REST-KEY"])
+
+    def test_xml_key_in_post_body(self):
+        fake = FakePanorama()
+        client = ph.PanoramaClient(make_settings(key_in_header=False), transport=fake, log=lambda *_: None)
+        client.op("system_info")
+        params, headers = fake.sent[0]
+        self.assertEqual(params["key"], "SECRET-KEY")
+        self.assertNotIn("X-PAN-KEY", headers)
 
     def test_error_response_maps_code_and_hint(self):
         denied = b'<response status="error" code="16"><msg><line>Unauthorized request</line></msg></response>'
@@ -345,7 +426,7 @@ class ClientTests(unittest.TestCase):
         entries = client.rest_get("Panorama/DeviceGroups", {"location": "panorama"})
         params, headers = fake.sent[0]
         self.assertEqual(entries[0]["@name"], "DG-Branch")
-        self.assertEqual(headers["X-PAN-KEY"], "SECRET-KEY")
+        self.assertEqual(headers["X-PAN-KEY"], "REST-KEY")
         self.assertEqual(params, {"location": "panorama"})
 
     def test_rest_permission_error_has_hint(self):
@@ -372,6 +453,63 @@ class ParserTests(unittest.TestCase):
         ses = ph.parse_session_info(ET.fromstring(SESSION_INFO).find("result"))
         self.assertEqual(ses["session_util_pct"], "85.0")
 
+    def test_parse_disk_space(self):
+        rows = ph.parse_disk_space(ET.fromstring(DISK_SPACE).find("result"), "pano-lab", "P1")
+        self.assertEqual([(r["mount"], r["use_pct"]) for r in rows],
+                         [("/", "95"), ("/opt/pancfg", "65"), ("/opt/panlogs", "98")])
+
+    def test_parse_ntp(self):
+        ntp = ph.parse_ntp(ET.fromstring(NTP).find("result"))
+        self.assertEqual(ntp["ntp_synched"], "LOCAL")
+        self.assertEqual(ntp["ntp_servers"], "192.0.2.123 (rejected, reachable=no)")
+        self.assertEqual(ph.parse_ntp(ET.Element("result")), {})
+
+    def test_parse_dp_resources(self):
+        row = ph.parse_dp_resources(ET.fromstring(DP_RESOURCES).find("result"))
+        self.assertEqual(row, {"dp_cpu_pct": "61.3", "packet_buffer_pct": "12.0"})
+
+    def test_certificate_row_never_keeps_private_key(self):
+        entry = ET.fromstring(SHARED_CERTS).find("result/certificate/entry")
+        row = ph.certificate_row("shared", entry)
+        self.assertEqual(row["has-private-key"], "yes")
+        self.assertLess(int(row["days_left"]), 0)
+        self.assertNotIn("PRIVATEBLOB", json.dumps(row))
+        self.assertNotIn("PUBLICBLOB", json.dumps(row))
+
+    def test_days_left(self):
+        now = 1_000_000_000  # 2001-09-09 01:46:40 UTC
+        self.assertEqual(ph.days_left(str(now + 5 * 86400), now), "5")
+        self.assertEqual(ph.days_left("Sep 19 01:46:40 2001 GMT", now), "10")
+        self.assertEqual(ph.days_left("2001/09/07 01:46:40", now), "-2")
+        self.assertEqual(ph.days_left("N/A", now), "")
+
+    def test_panorama_ha_and_load_findings(self):
+        data = ph.Collector(None, make_settings()).data
+        data["panorama_ha"] = ph.flatten(ET.fromstring(HA_DEGRADED).find("result"))
+        data["panorama_resources"] = {"mgmt_cpu_pct": "97.0", "mgmt_mem_pct": "40.0"}
+        data["resources"] = [{"serial": "001", "hostname": "fw-a", "dp_cpu_pct": "88.0", "packet_buffer_pct": "1"}]
+        found = [f["finding"] for f in ph.evaluate(data)]
+        for text in ("Panorama HA peer connection is 'down'", "Panorama HA local state is 'primary-suspended'",
+                     "Panorama HA running config is 'not synchronized'", "Management CPU at 97.0%",
+                     "Dataplane CPU at 88.0%"):
+            self.assertIn(text, found)
+        self.assertFalse(any("memory" in f or "Packet buffer" in f for f in found))
+
+    def test_device_certificate_findings(self):
+        data = ph.Collector(None, make_settings()).data
+        soon = time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime(time.time() + 5 * 86400))
+        data["devices"] = [
+            {"serial": "1", "hostname": "fw-a", "connected": "yes", "device-cert-present": "None"},
+            {"serial": "2", "hostname": "fw-b", "connected": "yes", "device-cert-present": "Valid",
+             "device-cert-expiry-date": soon},
+            {"serial": "3", "hostname": "fw-c", "connected": "yes", "device-cert-present": "Valid",
+             "device-cert-expiry-date": "2099/01/01 00:00:00"},
+        ]
+        found = {(f["target"], f["finding"]) for f in ph.evaluate(data) if f["area"] == "certificates"}
+        self.assertIn(("fw-a", "Device certificate is 'None'"), found)
+        self.assertTrue(any(t == "fw-b" and "expires in" in f for t, f in found))
+        self.assertFalse(any(t == "fw-c" for t, _ in found))
+
     def test_rule_evaluation(self):
         rules = ET.fromstring(RULES_DG).find("result/rules").findall("entry")
         rows = [ph.rule_row("DG", "pre-rulebase", i, e) for i, e in enumerate(rules, 1)]
@@ -388,7 +526,8 @@ class EndToEndTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         env = Path(tmp.name) / ".env"
-        env.write_text(f"PANORAMA_HOST={LAB_HOST}\nALLOWED_HOSTS={LAB_HOST}\nPANORAMA_API_KEY=SECRET-KEY\n"
+        env.write_text(f"PANORAMA_HOST={LAB_HOST}\nALLOWED_HOSTS={LAB_HOST}\nPANORAMA_XML_API_KEY=SECRET-KEY\n"
+                       "PANORAMA_REST_API_KEY=REST-KEY\n"
                        f"REQUEST_DELAY_SEC=0\nAPI_MODE={mode}\n", encoding="utf-8")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(ph.time, "sleep"):  # skip log-poll waits
@@ -402,19 +541,33 @@ class EndToEndTests(unittest.TestCase):
         names = {p.name for p in report_dir.iterdir()}
         for expected in ("report.html", "inventory.csv", "sync_status.csv", "security_rules.csv",
                          "rule_findings.csv", "findings.csv", "jobs.csv", "system_logs.csv",
-                         "firewall_resources.csv"):
+                         "firewall_resources.csv", "certificates.csv", "disk_usage.csv"):
             self.assertIn(expected, names)
 
         findings = (report_dir / "findings.csv").read_text(encoding="utf-8-sig")
         for text in ("Firewall not connected", "HA state is 'suspended'", "Out of Sync",
-                     "CommitAll failed", "Log collector not connected", "Session table utilisation"):
+                     "CommitAll failed", "Log collector not connected", "Session table utilisation",
+                     "Clock is not synchronised to an NTP server", "/ is 95% full",
+                     "shared: old-ca,Certificate expired",
+                     "template TPL-Branch: gp-portal,Certificate expires in 10 days"):
             self.assertIn(text, findings)
+        self.assertNotIn("panlogs", findings)  # log partition is full by design
 
+        disk = (report_dir / "disk_usage.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("pano-lab", disk)
+        self.assertIn("fw-b", disk)  # targeted firewalls' disks too
+        resources = (report_dir / "firewall_resources.csv").read_text(encoding="utf-8-sig")
+        self.assertIn("61.3", resources)  # dataplane CPU
+
+        for path in report_dir.iterdir():
+            text = path.read_text(encoding="utf-8-sig")
+            for secret in ("SECRET-KEY", "REST-KEY", "PRIVATEBLOB"):
+                self.assertNotIn(secret, text, path.name)
         html_text = (report_dir / "report.html").read_text(encoding="utf-8")
         self.assertIn("fw-a", html_text)
-        self.assertNotIn("SECRET-KEY", html_text)
-        for params, _ in fake.sent:
+        for params, headers in fake.sent:
             self.assertIn(params["type"], ("op", "config", "log"))
+            self.assertEqual(headers["X-PAN-KEY"], "SECRET-KEY")  # XML key only
 
     def test_rest_run_writes_rules_and_inventory(self):
         code, fake, out_dir, stdout = self.run_main(mode="rest")
@@ -436,8 +589,8 @@ class EndToEndTests(unittest.TestCase):
 
         html_text = (report_dir / "report.html").read_text(encoding="utf-8")
         self.assertIn("Not collected", html_text)
-        self.assertNotIn("SECRET-KEY", html_text)
-        self.assertTrue(all(h.get("X-PAN-KEY") == "SECRET-KEY" for _, h in fake.sent))
+        self.assertNotIn("REST-KEY", html_text)
+        self.assertTrue(all(h.get("X-PAN-KEY") == "REST-KEY" for _, h in fake.sent))  # REST key only
 
     def rule_calls(self, fake):
         return [p.get("device-group", "shared") for p, _ in fake.sent if "location" in p
@@ -483,10 +636,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("does not allow 'Operational Requests'", out.getvalue())
 
     def test_dry_run_sends_nothing(self):
-        code, fake, out_dir, stdout = self.run_main("--dry-run")
+        code, fake, out_dir, stdout = self.run_main("--dry-run", "--targeted")
         self.assertEqual(code, 0)
         self.assertEqual(fake.sent, [])
-        self.assertIn("op devices_all", stdout)
+        for call in ("op devices_all", "op disk_space", "op ntp", "config show /config/shared/certificate",
+                     "op dp_resources target=<serial>"):
+            self.assertIn(call, stdout)
         self.assertEqual(list(out_dir.glob("2*")), [])
 
 

@@ -46,6 +46,8 @@ DEFAULTS = {
     "PANORAMA_HOST": "",
     "PANORAMA_PORT": "443",
     "PANORAMA_API_KEY": "",
+    "PANORAMA_XML_API_KEY": "",
+    "PANORAMA_REST_API_KEY": "",
     "ALLOWED_HOSTS": "",
     "API_MODE": "rest",
     "REST_VERSION": "v11.0",
@@ -69,6 +71,9 @@ DEFAULTS = {
 # cannot widen the lab-host lock.
 FILE_ONLY_KEYS = {"ALLOWED_HOSTS"}
 
+# Each API has its own key; PANORAMA_API_KEY is the fallback for either.
+API_KEY_VARS = {"xml": "PANORAMA_XML_API_KEY", "rest": "PANORAMA_REST_API_KEY"}
+
 
 class ConfigError(Exception):
     pass
@@ -78,7 +83,8 @@ class ConfigError(Exception):
 class Settings:
     host: str
     port: int
-    api_key: str
+    xml_api_key: str
+    rest_api_key: str
     allowed_hosts: list
     verify_tls: bool
     ca_bundle: str
@@ -92,21 +98,29 @@ class Settings:
     enable_targeted: bool
     max_targeted: int
     output_dir: Path
-    key_source: str = ""
+    key_sources: dict = field(default_factory=dict)  # api mode -> where its key came from
     http_method: str = "POST"
     api_mode: str = "xml"
     rest_version: str = "v11.0"
     device_groups: list = field(default_factory=list)
 
+    @property
+    def api_key(self):
+        """The key for the current API_MODE."""
+        return self.rest_api_key if self.api_mode == "rest" else self.xml_api_key
+
     def key_label(self):
         """Masked key description, for comparing with the key used in curl."""
-        if not self.api_key:
-            return "no API key"
+        key = self.api_key
+        if not key:
+            return f"no {self.api_mode.upper()} API key"
         if self.api_mode == "rest":
             sent = "REST GET, X-PAN-KEY header"
         else:
             sent = f"XML {self.http_method}, " + ("X-PAN-KEY header" if self.key_in_header else "POST body")
-        return f"API key ...{self.api_key[-4:]} ({len(self.api_key)} chars, from {self.key_source}), sent via {sent}"
+        source = self.key_sources.get(self.api_mode, "")
+        return (f"{self.api_mode.upper()} API key ...{key[-4:]} ({len(key)} chars"
+                f"{', from ' + source if source else ''}), sent via {sent}")
 
 
 def load_env_file(path):
@@ -134,12 +148,18 @@ def load_settings(env_path, environ=None, require_key=True):
     environ = os.environ if environ is None else environ
     values = dict(DEFAULTS)
     values.update(load_env_file(env_path))
-    key_source = f"{env_path}"
+    sources = {name: f"{env_path} {name}" for name in ("PANORAMA_API_KEY", *API_KEY_VARS.values())}
     for key in DEFAULTS:
         if key not in FILE_ONLY_KEYS and environ.get(key):
             values[key] = environ[key]
-            if key == "PANORAMA_API_KEY":
-                key_source = "environment variable PANORAMA_API_KEY"
+            if key in sources:
+                sources[key] = f"environment variable {key}"
+
+    keys, key_sources = {}, {}
+    for mode, var in API_KEY_VARS.items():
+        name = var if values[var].strip() else "PANORAMA_API_KEY"
+        keys[mode] = values[name].strip()
+        key_sources[mode] = sources[name]
 
     host = values["PANORAMA_HOST"].strip()
     allowed = [h.strip().lower() for h in values["ALLOWED_HOSTS"].split(",") if h.strip()]
@@ -150,9 +170,6 @@ def load_settings(env_path, environ=None, require_key=True):
             f"PANORAMA_HOST '{host}' is not listed in ALLOWED_HOSTS. "
             "This tool is locked to the lab Panorama; refusing to run."
         )
-    if require_key and not values["PANORAMA_API_KEY"].strip():
-        raise ConfigError("PANORAMA_API_KEY is empty. Put the lab API key in .env.")
-
     http_method = values["HTTP_METHOD"].strip().upper()
     if http_method not in ("POST", "GET"):
         raise ConfigError("HTTP_METHOD must be POST or GET")
@@ -161,6 +178,9 @@ def load_settings(env_path, environ=None, require_key=True):
     api_mode = values["API_MODE"].strip().lower()
     if api_mode not in ("rest", "xml"):
         raise ConfigError("API_MODE must be rest or xml")
+    if require_key and not keys[api_mode]:
+        raise ConfigError(f"{API_KEY_VARS[api_mode]} is empty (API_MODE={api_mode}). "
+                          f"Put the lab {api_mode.upper()} API key in .env.")
     rest_version = values["REST_VERSION"].strip()
     if not re.fullmatch(r"v\d+\.\d+", rest_version):
         raise ConfigError("REST_VERSION must look like v11.0 (your Panorama's major.minor version)")
@@ -173,7 +193,8 @@ def load_settings(env_path, environ=None, require_key=True):
         return Settings(
             host=host,
             port=int(values["PANORAMA_PORT"]),
-            api_key=values["PANORAMA_API_KEY"].strip(),
+            xml_api_key=keys["xml"],
+            rest_api_key=keys["rest"],
             allowed_hosts=allowed,
             verify_tls=_bool(values["VERIFY_TLS"]),
             ca_bundle=values["CA_BUNDLE"].strip(),
@@ -187,7 +208,7 @@ def load_settings(env_path, environ=None, require_key=True):
             enable_targeted=_bool(values["ENABLE_TARGETED"]),
             max_targeted=int(values["MAX_TARGETED_FIREWALLS"]),
             output_dir=output_dir,
-            key_source=key_source,
+            key_sources=key_sources,
             http_method=http_method,
             api_mode=api_mode,
             rest_version=rest_version,
@@ -216,10 +237,15 @@ OP_COMMANDS = {
     "log_collectors": "<show><log-collector><connected></connected></log-collector></show>",
     "session_info": "<show><session><info></info></session></show>",
     "system_resources": "<show><system><resources></resources></system></show>",
+    "disk_space": "<show><system><disk-space></disk-space></system></show>",
+    "ntp": "<show><ntp></ntp></show>",
+    # Firewall dataplane CPU and packet buffers, last 1 minute.
+    "dp_resources": "<show><running><resource-monitor><minute><last>1</last></minute></resource-monitor></running></show>",
 }
 ALLOWED_OP = frozenset(OP_COMMANDS.values())
 # Commands that may be proxied to a managed firewall with target=<serial>.
-TARGETED_OP = frozenset(OP_COMMANDS[n] for n in ("system_info", "ha_state", "session_info", "system_resources"))
+TARGETED_OP = frozenset(OP_COMMANDS[n] for n in ("system_info", "ha_state", "session_info", "system_resources",
+                                                 "disk_space", "ntp", "dp_resources"))
 
 ALLOWED_PARAMS = {
     "op": {"type", "cmd", "target"},
@@ -451,9 +477,9 @@ class PanoramaClient:
         method = self.settings.http_method
         headers = {"Content-Type": "application/x-www-form-urlencoded"} if method == "POST" else {}
         if self.settings.key_in_header:
-            headers["X-PAN-KEY"] = self.settings.api_key
+            headers["X-PAN-KEY"] = self.settings.xml_api_key
         else:
-            body_params["key"] = self.settings.api_key  # POST body only; load_settings forbids GET here
+            body_params["key"] = self.settings.xml_api_key  # POST body only; load_settings forbids GET here
         status, payload = self._send("/api/", urllib.parse.urlencode(body_params), headers, method)
 
         try:
@@ -491,7 +517,7 @@ class PanoramaClient:
             return []
 
         req_type = f"rest:{endpoint}"
-        headers = {"X-PAN-KEY": self.settings.api_key, "Accept": "application/json"}
+        headers = {"X-PAN-KEY": self.settings.rest_api_key, "Accept": "application/json"}
         status, payload = self._send(f"/restapi/{self.settings.rest_version}/{endpoint}", qs, headers, "GET")
         try:
             doc = json.loads(payload)
@@ -594,7 +620,7 @@ def top_entries(elem):
 # --------------------------------------------------------------------------
 
 PANORAMA_DEVICE_XPATH = "/config/devices/entry[@name='localhost.localdomain']"
-SECTIONS = ["panorama", "devices", "sync", "jobs", "collectors", "rules", "logs", "targeted"]
+SECTIONS = ["panorama", "devices", "sync", "jobs", "collectors", "rules", "certificates", "logs", "targeted"]
 
 
 QUICK_DEVICE_GROUPS = 2  # --quick: rules for shared + this many device groups
@@ -607,11 +633,13 @@ class Collector:
         self.client = client
         self.settings = settings
         self.data = {
-            "panorama": {}, "panorama_ha": {}, "devices": [], "sync": [], "jobs": [],
-            "log_collectors": [], "rules": [], "system_logs": [], "config_logs": [],
-            "resources": [], "errors": [], "unavailable": [], "scope_note": "",
+            "panorama": {}, "panorama_ha": {}, "panorama_resources": {}, "panorama_ntp": {},
+            "devices": [], "sync": [], "jobs": [], "log_collectors": [], "rules": [], "certificates": [],
+            "system_logs": [], "config_logs": [], "resources": [], "disk": [],
+            "errors": [], "unavailable": [], "scope_note": "",
         }
         self._device_groups = None
+        self._templates = None
         self._dg_entries = None  # REST: device-group entry dicts
         self._panorama_query = {"location": "panorama"}  # REST: query form that worked for Panorama/*
 
@@ -643,10 +671,18 @@ class Collector:
         info = self.client.op("system_info")
         system = info.find("system")
         self.data["panorama"] = flatten(system if system is not None else info)
-        try:
-            self.data["panorama_ha"] = flatten(self.client.op("ha_state"))
-        except ApiError as exc:
-            self._error("panorama (HA)", exc)
+        hostname = self.data["panorama"].get("hostname") or "Panorama"
+        serial = self.data["panorama"].get("serial", "")
+        for label, name, store in (
+            ("HA", "ha_state", lambda r: self.data.update(panorama_ha=flatten(r))),
+            ("resources", "system_resources", lambda r: self.data.update(panorama_resources=parse_resources(r))),
+            ("disk", "disk_space", lambda r: self.data["disk"].extend(parse_disk_space(r, hostname, serial))),
+            ("NTP", "ntp", lambda r: self.data.update(panorama_ntp=parse_ntp(r))),
+        ):
+            try:
+                store(self.client.op(name))
+            except ApiError as exc:
+                self._error(f"panorama ({label})", exc)
 
     def collect_devices(self):
         result = self.client.op("devices_all")
@@ -666,7 +702,9 @@ class Collector:
         rows += self._sync_rows("device-group", dg_entries)
         try:
             tpl_result = self.client.op("templates")
-            rows += self._sync_rows("template", tpl_result.findall("./templates/entry"))
+            tpl_entries = tpl_result.findall("./templates/entry")
+            self._templates = [e.get("name") for e in tpl_entries if e.get("name")]
+            rows += self._sync_rows("template", tpl_entries)
         except ApiError as exc:
             self._error("sync (templates)", exc)
         self.data["sync"] = rows
@@ -848,16 +886,49 @@ class Collector:
         if self.max_groups is not None:
             selected = selected[: self.max_groups]
         if selected != list(names):
-            note = (f"Limited run: security rules for shared + {len(selected)} of {len(names)} device groups "
-                    f"({', '.join(selected) or 'none'})")
-            self.data["scope_note"] = note
-            print(f"  {note}")
+            self._limit_note(f"security rules for shared + {len(selected)} of {len(names)} device groups "
+                             f"({', '.join(selected) or 'none'})")
         return selected
+
+    def _limit_note(self, text):
+        """Record that this run collected less than a full run would; shown at the top of the report."""
+        note = self.data["scope_note"]
+        self.data["scope_note"] = f"{note}; {text}" if note else f"Limited run: {text}"
+        print(f"  Limited run: {text}")
 
     def _progress(self, step, total, location, rulebase, count, started):
         if not self.client.dry_run:
             print(f"  [{step}/{total}] {location} {rulebase}: {count} rules ({time.monotonic() - started:.1f}s)",
                   flush=True)
+
+    def collect_certificates(self):
+        """Certificate expiry: Panorama's own, shared, and each template's shared certificates."""
+        if self._templates is None:
+            names = self.client.request(
+                {"type": "config", "action": "get",
+                 "xpath": f"{PANORAMA_DEVICE_XPATH}/template/entry/@name"},
+                "config get template names")
+            self._templates = [e.get("name") for e in top_entries(names) if e.get("name")]
+        templates = list(self._templates)
+        if self.max_groups is not None and len(templates) > self.max_groups:
+            self._limit_note(f"certificates for {self.max_groups} of {len(templates)} templates")
+            templates = templates[: self.max_groups]
+        if self.client.dry_run and not templates:
+            print("  [dry-run] + 1 config show call per template")
+
+        locations = [("panorama", "/config/panorama/certificate"), ("shared", "/config/shared/certificate")]
+        locations += [(f"template {t}", f"{PANORAMA_DEVICE_XPATH}/template/entry[@name='{t}']/config/shared/certificate")
+                      for t in templates]
+        rows = []
+        for location, xpath in locations:
+            try:
+                result = self.client.config_show(xpath)
+            except ApiError as exc:
+                if exc.code not in ("7", "13"):  # 7/13: no certificates at this location
+                    self._error(f"certificates ({location})", exc)
+                continue
+            rows += [certificate_row(location, entry) for entry in top_entries(result)]
+        self.data["certificates"] = rows
 
     def collect_logs(self):
         since = (datetime.now() - timedelta(hours=self.settings.log_window_hours)).strftime("%Y/%m/%d %H:%M:%S")
@@ -876,22 +947,34 @@ class Collector:
         serials = [d.get("serial", "") for d in self.data["devices"] if d.get("connected") == "yes"]
         if self.client.dry_run and not serials:
             serials = ["<serial>"]
-            print(f"  [dry-run] up to {self.settings.max_targeted} connected firewalls, 3 calls each:")
+            print(f"  [dry-run] up to {self.settings.max_targeted} connected firewalls, "
+                  f"{len(TARGETED_CALLS)} calls each:")
         rows = []
         for serial in serials[: self.settings.max_targeted]:
             if serial == "<serial>":
-                for name in ("ha_state", "session_info", "system_resources"):
+                for name in TARGETED_CALLS:
                     print(f"  [dry-run] op {name} target=<serial>")
                 continue
             row = {"serial": serial}
             dev = next((d for d in self.data["devices"] if d.get("serial") == serial), {})
             row["hostname"] = dev.get("hostname", "")
-            try:
-                row.update(parse_ha(self.client.op("ha_state", target=serial)))
-                row.update(parse_session_info(self.client.op("session_info", target=serial)))
-                row.update(parse_resources(self.client.op("system_resources", target=serial)))
-            except ApiError as exc:
-                row["error"] = str(exc)
+            errors = []
+            for name in TARGETED_CALLS:
+                try:
+                    result = self.client.op(name, target=serial)
+                except ApiError as exc:
+                    errors.append(f"{name}: {exc}")
+                    if exc.code not in ("1", "17", "18"):
+                        break  # unreachable or denied: the remaining calls would fail the same way
+                    continue
+                if name == "disk_space":
+                    disks = parse_disk_space(result, row["hostname"] or serial, serial)
+                    self.data["disk"] += disks
+                    row["disk_max_pct"] = max((d["use_pct"] for d in disks), key=float, default="")
+                else:
+                    row.update(TARGETED_CALLS[name](result))
+            if errors:
+                row["error"] = "; ".join(errors)
             rows.append(row)
         self.data["resources"] = rows
 
@@ -973,12 +1056,106 @@ def parse_resources(result):
     return row
 
 
+def _numbers(text):
+    return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", text or "")]
+
+
+def parse_dp_resources(result):
+    """Dataplane CPU (average over cores, busiest dataplane) and packet-buffer use from resource-monitor."""
+    cpu = []
+    for avg in result.iter("cpu-load-average"):
+        values = [n for e in avg.findall("entry") for n in _numbers(e.findtext("value"))]
+        if values:
+            cpu.append(sum(values) / len(values))
+    buffers = [n for e in result.iter("entry")
+               if (e.findtext("name") or "").strip().lower().startswith("packet buffer")
+               for n in _numbers(e.findtext("value"))]
+    return {"dp_cpu_pct": f"{max(cpu):.1f}" if cpu else "",
+            "packet_buffer_pct": f"{max(buffers):.1f}" if buffers else ""}
+
+
+def parse_disk_space(result, device, serial=""):
+    """Parse the `df -h` text in show system disk-space into one row per /dev filesystem."""
+    rows = []
+    for line in "".join(result.itertext()).splitlines():
+        m = re.match(r"(/\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)%\s+(\S+)$", line.strip())
+        if m:
+            rows.append({"device": device, "serial": serial, "filesystem": m.group(1), "size": m.group(2),
+                         "used": m.group(3), "avail": m.group(4), "use_pct": m.group(5), "mount": m.group(6)})
+    return rows
+
+
+def parse_ntp(result):
+    """show ntp: which server the clock is synched to ('LOCAL' = none) and each server's status."""
+    flat = flatten(result)
+    if "synched" not in flat:
+        return {}
+    servers = []
+    for key in sorted(k for k in flat if k.endswith("/name")):
+        prefix = key[: -len("/name")]
+        servers.append(f"{flat[key]} ({flat.get(prefix + '/status', '?')}, "
+                       f"reachable={flat.get(prefix + '/reachable', '?')})")
+    return {"ntp_synched": flat["synched"], "ntp_servers": "; ".join(servers)}
+
+
+def days_left(value, now=None):
+    """Whole days until a date given as epoch seconds or a PAN-OS date string; '' if unparseable."""
+    text = " ".join(str(value or "").split())
+    now = time.time() if now is None else now
+    expiry = None
+    if text.isdigit():
+        expiry = int(text)
+    else:
+        text = re.sub(r"\s+(GMT|UTC)$", "", text)
+        for fmt in ("%b %d %H:%M:%S %Y", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
+            try:
+                expiry = (datetime.strptime(text, fmt) - datetime(1970, 1, 1)).total_seconds()
+                break
+            except ValueError:
+                pass
+    return "" if expiry is None else str(int((expiry - now) // 86400))
+
+
+CERT_FIELDS = ("common-name", "subject", "issuer", "not-valid-before", "not-valid-after", "expiry-epoch",
+               "algorithm", "ca")
+
+
+def certificate_row(location, entry, now=None):
+    # Named fields only: a certificate entry also holds the (encrypted) private key, which must
+    # never reach a report, so this deliberately does not flatten() the entry.
+    row = {"location": location, "name": entry.get("name", "")}
+    for name in CERT_FIELDS:
+        row[name] = (entry.findtext(name) or "").strip()
+    row["has-private-key"] = "yes" if entry.find("private-key") is not None else "no"
+    row["days_left"] = days_left(row["expiry-epoch"] or row["not-valid-after"], now)
+    return row
+
+
+# Per-firewall calls for --targeted, in order, with their parsers (disk_space is handled separately).
+TARGETED_CALLS = {
+    "ha_state": parse_ha,
+    "session_info": parse_session_info,
+    "system_resources": parse_resources,
+    "dp_resources": parse_dp_resources,
+    "disk_space": None,
+}
+
+
 # --------------------------------------------------------------------------
 # Health findings
 # --------------------------------------------------------------------------
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 HEALTHY_HA_STATES = {"", "active", "passive", "active-primary", "active-secondary", "disabled"}
+BAD_DEVICE_CERT = {"none", "no", "expired", "invalid", "not present"}
+CERT_WARN_DAYS = 30
+# (field, label, limit %) for management plane and dataplane load.
+LOAD_LIMITS = (("session_util_pct", "Session table utilisation", 80),
+               ("mgmt_cpu_pct", "Management CPU", 85),
+               ("mgmt_mem_pct", "Management memory", 90),
+               ("dp_cpu_pct", "Dataplane CPU", 80),
+               ("packet_buffer_pct", "Packet buffer", 80))
+DISK_LIMITS = (("high", 90), ("medium", 80))
 
 
 def _finding(findings, severity, area, target, finding, detail=""):
@@ -1022,6 +1199,16 @@ def evaluate(data):
         ha_state = dev.get("ha/state", "").lower()
         if ha_state not in HEALTHY_HA_STATES:
             _finding(findings, "high", "high-availability", name, f"HA state is '{ha_state}'")
+        if dev.get("connected") == "yes":
+            cert = dev.get("device-cert-present", "")
+            left = days_left(dev.get("device-cert-expiry-date", ""))
+            if cert.lower() in BAD_DEVICE_CERT:
+                _finding(findings, "medium", "certificates", name, f"Device certificate is '{cert}'",
+                         "needed for cloud services such as WildFire, URL filtering and telemetry")
+            elif left and int(left) <= CERT_WARN_DAYS:
+                _finding(findings, "medium", "certificates", name,
+                         f"Device certificate {'expired' if int(left) < 0 else f'expires in {left} days'}",
+                         dev.get("device-cert-expiry-date", ""))
         for key, value in dev.items():
             low = value.lower()
             if "status" in key and ("out of sync" in low or "out-of-sync" in low):
@@ -1056,6 +1243,42 @@ def evaluate(data):
         conn = _ends(ha, "peer-info/conn-status")
         if conn and conn.lower() != "up":
             _finding(findings, "high", "panorama", "Panorama", f"Panorama HA peer connection is '{conn}'")
+        local = _ends(ha, "local-info/state").lower()
+        if local and "active" not in local and "passive" not in local:
+            _finding(findings, "high", "panorama", "Panorama", f"Panorama HA local state is '{local}'")
+        sync = _ends(ha, "running-sync")
+        if sync and sync.lower() != "synchronized" and _ends(ha, "running-sync-enabled") != "no":
+            _finding(findings, "medium", "panorama", "Panorama", f"Panorama HA running config is '{sync}'",
+                     "the HA peers have different running configurations")
+
+    for field, label, limit in LOAD_LIMITS:
+        try:
+            if float(data["panorama_resources"].get(field, "")) >= limit:
+                _finding(findings, "high", "panorama", "Panorama",
+                         f"{label} at {data['panorama_resources'][field]}%")
+        except ValueError:
+            pass
+    ntp = data["panorama_ntp"]
+    if ntp and ntp["ntp_synched"].strip().lower() in ("", "local"):
+        _finding(findings, "medium", "panorama", "Panorama", "Clock is not synchronised to an NTP server",
+                 ntp["ntp_servers"] or "no NTP servers configured")
+
+    for disk in data["disk"]:
+        if "panlogs" in disk["mount"]:
+            continue  # log storage is kept full by design; PAN-OS purges the oldest logs
+        for severity, limit in DISK_LIMITS:
+            if int(disk["use_pct"]) >= limit:
+                _finding(findings, severity, "disk", disk["device"], f"{disk['mount']} is {disk['use_pct']}% full",
+                         f"{disk['used']} of {disk['size']} used, {disk['avail']} free")
+                break
+
+    for cert in data["certificates"]:
+        if cert["days_left"] and int(cert["days_left"]) <= CERT_WARN_DAYS:
+            expired = int(cert["days_left"]) < 0
+            _finding(findings, "high" if expired else "medium", "certificates",
+                     f"{cert['location']}: {cert['name']}",
+                     "Certificate expired" if expired else f"Certificate expires in {cert['days_left']} days",
+                     f"not valid after {cert['not-valid-after']}; CN {cert['common-name'] or '-'}")
 
     for lc in data["log_collectors"]:
         if lc.get("connected", "yes") != "yes":
@@ -1087,10 +1310,7 @@ def evaluate(data):
         name = row.get("hostname") or row["serial"]
         if row.get("error"):
             _finding(findings, "medium", "resources", name, "Per-firewall query failed", row["error"])
-            continue
-        for field, label, limit in (("session_util_pct", "Session table utilisation", 80),
-                                    ("mgmt_cpu_pct", "Management CPU", 85),
-                                    ("mgmt_mem_pct", "Management memory", 90)):
+        for field, label, limit in LOAD_LIMITS:
             try:
                 if float(row.get(field, "")) >= limit:
                     _finding(findings, "high", "resources", name, f"{label} at {row[field]}%")
@@ -1103,7 +1323,7 @@ def evaluate(data):
         _finding(findings, "medium", "collection", err["section"], "Section could not be collected", err["error"])
     if data.get("unavailable"):
         _finding(findings, "info", "collection", ", ".join(data["unavailable"]),
-                 "Not checked: the REST API has no operational data (connectivity, HA, sync, jobs, logs)",
+                 "Not checked: the REST API has no data for these sections",
                  "These need XML API access (API_MODE=xml)")
 
     findings.sort(key=lambda f: SEVERITY_ORDER[f["severity"]])
@@ -1143,7 +1363,14 @@ SYSLOG_COLS = ["receive_time", "time_generated", "device_name", "serial", "sever
 CONFIGLOG_COLS = ["receive_time", "admin", "client", "cmd", "path", "result", "device_name", "serial"]
 RESOURCE_COLS = ["hostname", "serial", "ha_enabled", "ha_local_state", "ha_peer_state", "ha_peer_conn",
                  "num-active", "num-max", "session_util_pct", "cps", "pps", "kbps",
-                 "mgmt_cpu_pct", "mgmt_mem_pct", "error"]
+                 "mgmt_cpu_pct", "mgmt_mem_pct", "dp_cpu_pct", "packet_buffer_pct", "disk_max_pct", "error"]
+DISK_COLS = ["device", "serial", "mount", "use_pct", "size", "used", "avail", "filesystem"]
+CERT_COLS = ["location", "name", "days_left", "not-valid-after", "common-name", "issuer", "subject",
+             "not-valid-before", "algorithm", "ca", "has-private-key", "expiry-epoch"]
+
+
+def by_expiry(certs):
+    return sorted(certs, key=lambda c: int(c["days_left"]) if c["days_left"] else 10**9)
 
 
 def columns_for(rows, preferred, include_extra=True):
@@ -1166,6 +1393,7 @@ def write_csv(path, rows, preferred):
 def csv_tables(data, findings):
     panorama = [{"field": k, "value": v} for k, v in data["panorama"].items()]
     panorama += [{"field": f"ha/{k}", "value": v} for k, v in data["panorama_ha"].items()]
+    panorama += [{"field": k, "value": v} for k, v in {**data["panorama_resources"], **data["panorama_ntp"]}.items()]
     tables = {
         "findings.csv": (findings, FINDING_COLS),
         "panorama.csv": (panorama, ["field", "value"]),
@@ -1175,14 +1403,18 @@ def csv_tables(data, findings):
         "log_collectors.csv": (data["log_collectors"], ["serial", "host-name", "connected"]),
         "security_rules.csv": (data["rules"], RULE_COLS),
         "rule_findings.csv": (rule_findings(data["rules"]), RULE_FINDING_COLS),
+        "certificates.csv": (by_expiry(data["certificates"]), CERT_COLS),
         "system_logs.csv": (data["system_logs"], SYSLOG_COLS),
         "config_logs.csv": (data["config_logs"], CONFIGLOG_COLS),
         "collection_errors.csv": (data["errors"], ["section", "error"]),
     }
     if data["resources"]:
         tables["firewall_resources.csv"] = (data["resources"], RESOURCE_COLS)
+    if data["disk"]:
+        tables["disk_usage.csv"] = (data["disk"], DISK_COLS)
     csv_section = {"panorama.csv": "panorama", "sync_status.csv": "sync", "jobs.csv": "jobs",
-                   "log_collectors.csv": "collectors", "system_logs.csv": "logs", "config_logs.csv": "logs"}
+                   "log_collectors.csv": "collectors", "certificates.csv": "certificates",
+                   "system_logs.csv": "logs", "config_logs.csv": "logs"}
     unavailable = set(data.get("unavailable", []))
     return {name: t for name, t in tables.items() if csv_section.get(name) not in unavailable}
 
@@ -1255,7 +1487,13 @@ def write_html(path, data, findings, settings, calls, started):
         pano_rows += [{"field": "HA enabled", "value": ha.get("enabled", "")},
                       {"field": "HA local state", "value": _ends(ha, "local-info/state")},
                       {"field": "HA peer state", "value": _ends(ha, "peer-info/state")},
-                      {"field": "HA peer connection", "value": _ends(ha, "peer-info/conn-status")}]
+                      {"field": "HA peer connection", "value": _ends(ha, "peer-info/conn-status")},
+                      {"field": "HA running config", "value": _ends(ha, "running-sync")}]
+    for key, label in (("mgmt_cpu_pct", "Management CPU %"), ("mgmt_mem_pct", "Management memory %"),
+                       ("ntp_synched", "NTP synched to"), ("ntp_servers", "NTP servers")):
+        value = data["panorama_resources"].get(key) or data["panorama_ntp"].get(key)
+        if value:
+            pano_rows.append({"field": label, "value": value})
 
     status_cols = sorted({k for d in devices for k in d if "policy-status" in k or "template-status" in k})
     inv_cols = columns_for(devices, INVENTORY_COLS[:2] + ["device-group", "template-stack"]
@@ -1284,6 +1522,8 @@ def write_html(path, data, findings, settings, calls, started):
         ("rules", "Security rules", _table(rule_summary_rows, ["location", "rulebase", "rules", "disabled"])
          + "<h3>Rule findings</h3>" + _table(rule_findings(data["rules"]), RULE_FINDING_COLS, "No rule findings."),
          "rules"),
+        ("certificates", f"Certificates (expiring within {CERT_WARN_DAYS} days first)",
+         _table(by_expiry(data["certificates"]), CERT_COLS[:8]), "certificates"),
         ("syslogs", f"System logs, severity high+ (last {settings.log_window_hours}h)",
          _table(data["system_logs"], columns_for(data["system_logs"], SYSLOG_COLS, include_extra=False)), "logs"),
         ("configlogs", f"Configuration logs (last {settings.log_window_hours}h)",
@@ -1296,8 +1536,11 @@ def write_html(path, data, findings, settings, calls, started):
                          "<p>The REST API has no endpoints for these sections; they need XML API access "
                          f"(API_MODE=xml):</p><ul>{items}</ul>"))
     if data["resources"]:
-        sections.append(("resources", "Per-firewall live status (management plane)",
+        sections.append(("resources", "Per-firewall live status (HA, sessions, CPU, memory)",
                          _table(data["resources"], columns_for(data["resources"], RESOURCE_COLS))))
+    if data["disk"]:
+        disks = sorted(data["disk"], key=lambda d: -int(d["use_pct"]))
+        sections.append(("disk", "Disk usage", _table(disks, DISK_COLS)))
     if data["errors"]:
         sections.append(("errors", "Collection errors", _table(data["errors"], ["section", "error"])))
 

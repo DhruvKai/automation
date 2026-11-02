@@ -7,9 +7,11 @@ It works with either Panorama API. Set the mode with `API_MODE` in `.env`:
 | `API_MODE` | Needs | Collects |
 |---|---|---|
 | `rest` (default) | REST API permissions: Policies > Security Pre/Post Rules, Panorama > Device Groups and Template Stacks | Firewall inventory (by device group and template stack), and security rules with rule findings |
-| `xml` | XML API permissions: Configuration, Operational Requests, Log | Everything in `rest`, plus connectivity, software/content versions, HA, device-group and template sync, push jobs, log collectors and logs |
+| `xml` | XML API permissions: Configuration, Operational Requests, Log (a read-only superuser role has all three) | Everything in `rest`, plus connectivity, software/content versions, HA, device-group and template sync, push jobs, log collectors, certificate expiry, Panorama CPU/memory/disk/NTP, and logs |
 
-The REST API has no operational endpoints. Connectivity, HA, sync status, jobs and logs are only available in `xml` mode.
+The REST API has no operational endpoints. Connectivity, HA, sync status, jobs, certificates and logs are only available in `xml` mode.
+
+Each API uses its own key: `PANORAMA_XML_API_KEY` and `PANORAMA_REST_API_KEY`. XML requests only ever send the XML key and REST requests only the REST key, so switching `API_MODE` needs no key edits.
 
 > **Read-only.** Every request is checked against a hard-coded allowlist before it is sent:
 > - **REST:** `GET` only, on an allowlist of endpoints. POST, PUT and DELETE are refused.
@@ -32,16 +34,19 @@ A REST run makes 4 calls plus 2 per device group.
 
 | Section | API call(s) | Used for |
 |---|---|---|
-| `panorama` | `show system info`, `show high-availability state` | Panorama version, uptime, HA |
+| `panorama` | `show system info`, `show high-availability state`, `show system resources`, `show system disk-space`, `show ntp` | Panorama version, uptime, HA state and HA config sync, management CPU and memory, disk usage, NTP sync |
 | `devices` | `show devices all` (one call for every firewall) | Inventory, connectivity, software/content versions, HA state, policy sync status |
 | `sync` | `show devicegroups`, `show templates` | Device-group and template sync per firewall |
 | `jobs` | `show jobs all` (most recent `MAX_JOBS` kept) | Failed commit/push jobs |
 | `collectors` | `show log-collector connected` | Log collector connectivity |
 | `rules` | config `show` of shared and per-device-group pre/post security rulebases (running config) | Same rule checks as REST mode |
+| `certificates` | config `show` of Panorama, shared and per-template shared certificates | Expired certificates, and certificates expiring within 30 days. Only named fields are kept; private keys never reach the report |
 | `logs` | log query: system logs with severity high or above, and config logs, over the last `LOG_WINDOW_HOURS` (capped at `MAX_LOGS`) | Critical events, recent changes |
-| `targeted` (off by default) | `show high-availability state`, `show session info`, `show system resources` with `target=<serial>` | Live HA, session-table use, management CPU and memory |
+| `targeted` (off by default) | `show high-availability state`, `show session info`, `show system resources`, `show running resource-monitor minute last 1`, `show system disk-space` with `target=<serial>` | Live HA, session-table use, management CPU and memory, dataplane CPU and packet buffer, disk usage |
 
-An XML run (without `--targeted`) makes about 10 calls plus 2 per device group.
+`show devices all` also gives each firewall's device-certificate status, which is checked too.
+
+An XML run (without `--targeted`) makes about 16 calls, plus 2 per device group and 1 per template.
 
 In both modes, calls go out one at a time with `REQUEST_DELAY_SEC` between them.
 
@@ -84,7 +89,9 @@ Run every command below from this folder. To update later, run `git pull`.
   - **Panorama > Device Groups** and **Template Stacks**
 
   The REST tab only has enable/disable, not read-only, but this tool only ever sends `GET`.
-- **XML mode:** the role needs, on its **XML API** tab: **Configuration**, **Operational Requests** and **Log**.
+- **XML mode:** the role needs, on its **XML API** tab: **Configuration**, **Operational Requests** and **Log**. A read-only superuser role covers all of them.
+
+You can have one key for each API. Put each in its own line in `.env`.
 
 ### 4. Create `.env`
 
@@ -101,12 +108,16 @@ Open `.env` in a text editor and fill in:
 ```
 PANORAMA_HOST=10.26.254.218
 ALLOWED_HOSTS=10.26.254.218
-PANORAMA_API_KEY=<paste the key here>
+PANORAMA_XML_API_KEY=<paste the XML API key here>
+PANORAMA_REST_API_KEY=<paste the REST API key here>
+API_MODE=xml
 ```
+
+`PANORAMA_API_KEY` still works as a fallback for whichever of the two is empty.
 
 Also check these two:
 
-- `API_MODE`: `rest` by default.
+- `API_MODE`: `rest` by default. Use `xml` for the full health check.
 - `REST_VERSION`: must match the version in your working REST URL, for example `v11.0` in `/restapi/v11.0/...`.
 
 Leave everything else as it is. `.env` is git-ignored; never commit it or share it.
@@ -180,9 +191,10 @@ python pano_healthcheck.py --env /path/to/other.env     # use a different settin
 python pano_healthcheck.py --help                       # list all options
 ```
 
-- `--sections` choices: `panorama`, `devices`, `sync`, `jobs`, `collectors`, `rules`, `logs`, `targeted`.
+- `--sections` choices: `panorama`, `devices`, `sync`, `jobs`, `collectors`, `rules`, `certificates`, `logs`, `targeted`.
 - In REST mode, only `devices` and `rules` produce data.
-- `--targeted` (XML mode only) checks up to `MAX_TARGETED_FIREWALLS` firewalls, with 3 extra calls per firewall.
+- `--targeted` (XML mode only) checks up to `MAX_TARGETED_FIREWALLS` firewalls, with 5 extra calls per firewall.
+- `--quick` in XML mode also limits certificate checks to the first 2 templates.
 
 ## Output
 
@@ -201,6 +213,8 @@ In XML mode only:
 - `sync_status.csv`
 - `jobs.csv`
 - `log_collectors.csv`
+- `certificates.csv` (soonest expiry first)
+- `disk_usage.csv` (Panorama, plus targeted firewalls)
 - `system_logs.csv`
 - `config_logs.csv`
 - `firewall_resources.csv` (with `--targeted`)
@@ -239,7 +253,9 @@ If one section fails, for example because a permission is missing, the run conti
 - The API key is always sent in the `X-PAN-KEY` header (XML mode can use the POST body instead). It is never put in a URL, so it doesn't end up in web server logs.
 - REST mode reads rules through the REST API, which may include candidate (uncommitted) changes. XML mode reads the **running** config.
 - In XML mode, log query times use the clock of the machine running the script. If that clock is in a different timezone from Panorama, the log window is offset by the difference.
-- Health thresholds are in `evaluate()` and `evaluate_rule()` in `pano_healthcheck.py`.
+- Health thresholds are in `evaluate()` and `evaluate_rule()` in `pano_healthcheck.py`. Load limits are in `LOAD_LIMITS`, disk limits in `DISK_LIMITS` (90% high, 80% medium), and certificate warnings in `CERT_WARN_DAYS` (30).
+- The `/opt/panlogs` log partition is not flagged when it is full. PAN-OS keeps it full by design and purges the oldest logs.
+- Licenses and available software/content updates are not checked: their XML commands are `<request>` commands, which this tool never sends.
 
 ## Tests
 
