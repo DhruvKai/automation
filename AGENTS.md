@@ -58,7 +58,11 @@ The whole tool is one file, `pano_healthcheck.py`. Its sections, in order:
   - A section that fails is recorded in `data["errors"]`, and the run continues.
 - **Health findings:** `evaluate()` (device, sync, job and resource rules) and `evaluate_rule()` (security-rule checks).
 - **Reports:** CSV via `write_csv()`/`csv_tables()`, and a self-contained HTML page via `write_html()`.
-- **CLI:** `main()` with `--diagnose`, `--dry-run`, `--sections`, `--targeted` and `--format`.
+- **Interactive menu:** `Tui` (arrow-key menus, numbered prompts as fallback; `read_key()` uses `msvcrt`/`termios`) and `MenuApp`.
+  - The menu runs through the same `PanoramaClient`, `Collector` and `run_health_check()` as the CLI; it never sends anything itself.
+  - Session settings may only make runs lighter than `.env` (delay never lower, `MAX_TARGETED_FIREWALLS` never higher).
+  - Inventory for the menus is fetched once and cached; refreshing is explicit.
+- **CLI:** `main()` with `--menu` (default with no options on a terminal), `--diagnose`, `--dry-run`, `--sections`, `--targeted`, `--firewalls` and `--format`.
 
 Other files:
 

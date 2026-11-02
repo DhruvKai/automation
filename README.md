@@ -140,6 +140,37 @@ This prints every API call a full run would make. It sends nothing to Panorama.
 
 ### 7. Run the health check
 
+#### The menu (easiest)
+
+```
+python pano_healthcheck.py
+```
+
+With no options, the script opens an interactive menu. It loads the firewalls, device groups and templates from Panorama (3 read-only calls), then fills the menus with them:
+
+| Key | Option | What it does |
+|---|---|---|
+| `1` | Full health check | Every section, every device group. Shows the estimated number of API calls |
+| `2` | Quick health check | Shared + the first 2 device groups (and 2 templates) |
+| `3` | Custom health check | Wizard: pick sections, device groups, the firewalls for live checks, and report formats. Then run it, or preview the exact calls first |
+| `4` | Browse Panorama (live) | Firewalls (details, live HA/sessions/CPU/disk per firewall), device groups and templates (members, sync; collect one group's rules), recent jobs, log collectors, Panorama status. XML mode only |
+| `5` | Diagnose API access | Same as `--diagnose` |
+| `6` | Preview API calls | Dry run of a full check; sends nothing |
+| `7` | Past reports | Earlier runs with their finding counts; open the HTML, view findings, open the folder |
+| `8` | Session settings | Switch API mode (if both keys are set), report formats, request delay, log window and limits, for this session only |
+
+After each run, a results screen shows the severity counts and top findings. From there you can open the HTML report, page through all findings, rule findings and collection errors, or open the report folder.
+
+**Keys:** `↑`/`↓` (`PgUp`/`PgDn`, `Home`/`End`) move, `Enter` selects, a menu's key letter or number jumps straight to it, and `Esc` goes back. In lists, typing filters by any text. In checklists, `Space` toggles, `+` selects all and `-` selects none. `Ctrl+C` cancels a running check and returns to the menu.
+
+Where arrow keys can't work (input piped, `TERM=dumb`, some Git Bash windows), the menu falls back to numbered prompts. In Git Bash, either use `winpty python pano_healthcheck.py`, or add `--menu` for the numbered version.
+
+Menu settings can only make a run *lighter* than `.env`. The request delay can't go below `REQUEST_DELAY_SEC`, and the live-check firewall count can't go above `MAX_TARGETED_FIREWALLS`.
+
+#### Command line
+
+Every option also works without the menu. Any option skips the menu.
+
 For a fast proof-of-concept run, start with `--quick`. It collects rules for shared plus only the first 2 device groups, which is about 8 calls:
 
 ```
@@ -188,6 +219,8 @@ python pano_healthcheck.py --format csv                 # CSV only, no HTML
 python pano_healthcheck.py --format html                # HTML only
 python pano_healthcheck.py --sections rules             # only some sections
 python pano_healthcheck.py --env /path/to/other.env     # use a different settings file
+python pano_healthcheck.py --firewalls 0079010001,0079010002   # live checks for these firewalls only
+python pano_healthcheck.py --menu                       # menu, even when options are given
 python pano_healthcheck.py --help                       # list all options
 ```
 

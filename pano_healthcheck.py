@@ -11,6 +11,7 @@ Every request passes a guard before anything is sent. XML: only allowlisted
 else raises ReadOnlyViolation.
 
 Usage:
+    python pano_healthcheck.py                 (interactive menu)
     python pano_healthcheck.py --diagnose
     python pano_healthcheck.py --dry-run
     python pano_healthcheck.py [--sections devices,sync] [--format html,csv] [--targeted]
@@ -23,9 +24,11 @@ import html
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -627,9 +630,10 @@ QUICK_DEVICE_GROUPS = 2  # --quick: rules for shared + this many device groups
 
 
 class Collector:
-    def __init__(self, client, settings, only_groups=None, max_groups=None):
-        self.only_groups = only_groups or []  # --device-groups: collect rules for these only
-        self.max_groups = max_groups          # --quick: cap on device groups
+    def __init__(self, client, settings, only_groups=None, max_groups=None, only_serials=None):
+        self.only_groups = only_groups or []    # --device-groups: collect rules for these only
+        self.max_groups = max_groups            # --quick: cap on device groups
+        self.only_serials = only_serials or []  # --firewalls: live checks for these only
         self.client = client
         self.settings = settings
         self.data = {
@@ -945,6 +949,9 @@ class Collector:
 
     def collect_targeted(self):
         serials = [d.get("serial", "") for d in self.data["devices"] if d.get("connected") == "yes"]
+        if self.only_serials:
+            # Without inventory data (devices section skipped) trust the list; the guard checks each serial.
+            serials = [s for s in self.only_serials if not self.data["devices"] or s in serials]
         if self.client.dry_run and not serials:
             serials = ["<serial>"]
             print(f"  [dry-run] up to {self.settings.max_targeted} connected firewalls, "
@@ -1677,18 +1684,1128 @@ def compare_key_methods(client):
 
 
 # --------------------------------------------------------------------------
+# Interactive menu
+# --------------------------------------------------------------------------
+
+SEV_STYLE = {"critical": "1;31", "high": "1;38;5;208", "medium": "33", "low": "36", "info": "2"}
+SECTION_INFO = {
+    "panorama": "Panorama version, HA, CPU/memory, disk, NTP",
+    "devices": "firewall inventory, connectivity, versions, device certificates",
+    "sync": "device-group and template sync status",
+    "jobs": "failed commit and push jobs",
+    "collectors": "log collector connectivity",
+    "rules": "security rule checks",
+    "certificates": "certificate expiry (Panorama, shared, templates)",
+    "logs": "high-severity system logs and config changes",
+    "targeted": "live per-firewall HA, sessions, CPU, packet buffer, disk",
+}
+REST_SECTIONS = [s for s in SECTIONS if hasattr(Collector, f"collect_{s}_rest")]
+REPORT_DIR_RE = re.compile(r"\d{8}-\d{6}")
+
+
+def estimate_calls(mode, sections, groups=0, templates=0, firewalls=0):
+    """Minimum number of API calls a run makes (each log query adds at least one poll)."""
+    if mode == "rest":
+        calls = 2 if "devices" in sections else 0
+        if "rules" in sections:
+            calls += 2 * (1 + groups) + (0 if "devices" in sections else 1)
+        return calls
+    per_section = {"panorama": 5, "devices": 1, "sync": 2, "jobs": 1, "collectors": 1, "logs": 4}
+    calls = sum(per_section.get(s, 0) for s in sections)
+    if "rules" in sections:
+        calls += 2 * (1 + groups) + (0 if "sync" in sections else 1)
+    if "certificates" in sections:
+        calls += 2 + templates + (0 if "sync" in sections else 1)
+    if "targeted" in sections:
+        calls += len(TARGETED_CALLS) * firewalls
+    return calls
+
+
+@dataclass
+class MenuItem:
+    key: str
+    label: str
+    hint: str = ""
+    style: str = ""
+    disabled: bool = False
+
+
+def _enable_ansi():
+    """Turn on ANSI escape handling in the Windows console; True if colors and redraws will work."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+                    and kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except (AttributeError, OSError):
+        return False
+
+
+WIN_KEYS = {"H": "up", "P": "down", "K": "left", "M": "right", "I": "pgup", "Q": "pgdn", "G": "home", "O": "end"}
+ANSI_KEYS = {"[A": "up", "[B": "down", "[C": "right", "[D": "left", "[5~": "pgup", "[6~": "pgdn",
+             "[H": "home", "[F": "end", "OH": "home", "OF": "end", "[1~": "home", "[4~": "end"}
+NAMED_KEYS = {"\r": "enter", "\n": "enter", "\x1b": "esc", "\x08": "backspace", "\x7f": "backspace",
+              " ": "space", "\t": "tab"}
+
+
+def read_key():
+    """Read one keypress: a named key ('up', 'enter', 'esc', ...) or the character typed."""
+    if os.name == "nt":
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return WIN_KEYS.get(msvcrt.getwch(), "")
+    else:
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = os.read(fd, 1).decode(errors="ignore")
+            if ch == "\x1b":
+                seq = ""
+                while len(seq) < 3 and seq not in ANSI_KEYS and select.select([fd], [], [], 0.03)[0]:
+                    seq += os.read(fd, 1).decode(errors="ignore")
+                if seq:
+                    return ANSI_KEYS.get(seq, "")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    return NAMED_KEYS.get(ch, ch)
+
+
+def _open_path(path):
+    """Open a report file or folder with the desktop's default application."""
+    if os.name == "nt":
+        os.startfile(str(path))
+    else:
+        import webbrowser
+        webbrowser.open(Path(path).resolve().as_uri())
+
+
+def _read_csv(path):
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            return list(csv.DictReader(fh))
+    except OSError:
+        return []
+
+
+class Tui:
+    """Terminal UI: arrow-key menus on a real terminal, numbered prompts otherwise (pipes, dumb terminals, tests)."""
+
+    def __init__(self, out=None, read_line=None, keys=None):
+        self.out = out or sys.stdout
+        terminal = self.out.isatty() and sys.stdin.isatty() and os.environ.get("TERM") != "dumb"
+        self.color = bool(terminal and not os.environ.get("NO_COLOR") and _enable_ansi())
+        self.arrows = keys is not None or (self.color and read_line is None)
+        self.read_line = read_line or input
+        if keys is not None:
+            keys = iter(keys)
+            self.read_key = lambda: next(keys)
+        else:
+            self.read_key = read_key
+        self.header = lambda: []
+        try:
+            "▸─·✓↑↓…".encode(getattr(self.out, "encoding", None) or "ascii")
+            self.g = {"cursor": "▸", "rule": "─", "dot": "·", "on": "✓", "updown": "↑↓", "more": "…"}
+        except (UnicodeEncodeError, LookupError):
+            self.g = {"cursor": ">", "rule": "-", "dot": "|", "on": "x", "updown": "up/down", "more": "~"}
+
+    # ---- output ----
+
+    def s(self, text, code):
+        return f"\033[{code}m{text}\033[0m" if self.color and code else str(text)
+
+    def write(self, text=""):
+        print(text, file=self.out, flush=True)
+
+    @property
+    def width(self):
+        return max(40, shutil.get_terminal_size((100, 30)).columns - 1)
+
+    @property
+    def height(self):
+        return max(12, shutil.get_terminal_size((100, 30)).lines)
+
+    def screen(self, title=""):
+        if self.arrows:
+            self.out.write("\033[H\033[2J\033[3J")
+        for line in self.header():
+            self.write(line)
+        if title:
+            self.write("\n " + self.s(title, "1"))
+        self.write()
+
+    def message(self, text, code="33"):
+        self.write("  " + self.s(text, code))
+
+    def pause(self, text="Press any key to continue"):
+        if self.arrows:
+            self.write(self.s(f"\n  {text}", "2"))
+            self.read_key()
+        else:
+            self.read_line(f"\n  {text.replace('any key', 'Enter')} ")
+
+    def prompt(self, label, default=""):
+        suffix = f" [{default}]" if str(default) != "" else ""
+        text = self.read_line(f"  {label}{suffix}: ").strip()
+        return text or str(default)
+
+    def fit(self, text, width):
+        text = str(text).replace("\n", " ")
+        return text if len(text) <= width else text[: max(0, width - 1)] + self.g["more"]
+
+    def format_table(self, rows, cols, width=None):
+        """Aligned plain-text table: (header line, [row lines]), shrunk to fit the terminal."""
+        width = (width or self.width) - 8
+        widths = {c: min(36, max([len(c)] + [len(str(r.get(c, ""))) for r in rows])) for c in cols}
+        while sum(widths.values()) + 2 * len(cols) > width and max(widths.values()) > 6:
+            widest = max(widths, key=widths.get)
+            widths[widest] -= 1
+
+        def line(values):
+            return "  ".join(self.fit(v, widths[c]).ljust(widths[c]) for c, v in zip(cols, values)).rstrip()
+
+        return line(cols), [line([r.get(c, "") for c in cols]) for r in rows]
+
+    def table_items(self, rows, cols, style=None):
+        head, lines = self.format_table(rows, cols)
+        items = [MenuItem(str(n), text, style=style(row) if style else "")
+                 for n, (row, text) in enumerate(zip(rows, lines), 1)]
+        return head, items
+
+    def table_lines(self, rows, cols, style=None):
+        head, lines = self.format_table(rows, cols)
+        return ["  " + self.s(head, "1")] + ["  " + self.s(text, style(row) if style else "")
+                                              for row, text in zip(rows, lines)]
+
+    # ---- input ----
+
+    def select(self, title, items, intro=(), head="", filterable=False, show_keys=True):
+        """Pick one item; returns its key, or None for Esc/back."""
+        return self._list(title, items, intro, head, False, (), None, filterable, show_keys)
+
+    def checklist(self, title, items, selected=(), limit=None, intro=(), head="", filterable=False):
+        """Pick any number of items; returns their keys in list order, or None if cancelled."""
+        return self._list(title, items, intro, head, True, selected, limit, filterable, False)
+
+    @staticmethod
+    def _filter(items, query):
+        words = query.lower().split()
+        return [i for i in items if all(w in f"{i.label} {i.hint}".lower() for w in words)]
+
+    def _list(self, title, items, intro, head, multi, selected, limit, filterable, show_keys):
+        chosen = {k for k in selected if any(i.key == k for i in items)}
+        if not self.arrows:
+            return self._plain_list(title, items, intro, head, multi, chosen, limit, filterable)
+        query, cursor, top, note = "", 0, 0, ""
+        while True:
+            shown = self._filter(items, query)
+            cursor = max(0, min(cursor, len(shown) - 1))
+            self.screen(title)
+            for line in intro:
+                self.write(line)
+            if intro:
+                self.write()
+            if filterable:
+                self.write(f"  {self.s('Filter:', '2')} {query}{self.s('_', '5')}   "
+                           + self.s(f"{len(shown)} of {len(items)}", "2"))
+            key_width = max([len(i.key) for i in items] + [1]) if show_keys else 0
+            indent = " " * (3 + (4 if multi else 0) + (key_width + 2 if key_width else 0))
+            if head:
+                self.write(self.s(indent + head, "1"))
+            rows = max(3, self.height - len(self.header()) - len(intro) - (10 if filterable else 8))
+            if cursor < top:
+                top = cursor
+            elif cursor >= top + rows:
+                top = cursor - rows + 1
+            top = max(0, min(top, max(0, len(shown) - rows)))
+            if top:
+                self.write(self.s(f"{indent}{self.g['updown'][0]} {top} more", "2"))
+            label_width = min(40, max([len(i.label) for i in items if i.hint] + [0]))
+            for idx in range(top, min(len(shown), top + rows)):
+                item = shown[idx]
+                self.write(self._item_line(item, idx == cursor, multi, item.key in chosen, key_width, label_width))
+            if not shown:
+                self.write(self.s(f"{indent}(nothing matches '{query}')", "2"))
+            if top + rows < len(shown):
+                self.write(self.s(f"{indent}{self.g['updown'][-1]} {len(shown) - top - rows} more", "2"))
+            help_text = f"{self.g['updown']} move"
+            if multi:
+                help_text += " · Space toggle · + all · - none · Enter confirm"
+                help_text += f" · {len(chosen)} selected" + (f" (max {limit})" if limit else "")
+            else:
+                help_text += " · Enter select" + (" · type a key" if show_keys and not filterable else "")
+            help_text += " · type to filter" if filterable else ""
+            self.write("\n  " + self.s(help_text + " · Esc back", "2"))
+            if note:
+                self.write("  " + self.s(note, "33"))
+                note = ""
+
+            key = self.read_key()
+            if key in ("up", "down", "pgup", "pgdn", "home", "end") and shown:
+                step = {"up": -1, "down": 1, "pgup": -rows, "pgdn": rows}.get(key)
+                if step in (-1, 1):
+                    cursor = (cursor + step) % len(shown)
+                elif step:
+                    cursor = max(0, min(len(shown) - 1, cursor + step))
+                else:
+                    cursor = 0 if key == "home" else len(shown) - 1
+            elif key == "enter":
+                if multi:
+                    return [i.key for i in items if i.key in chosen]
+                if shown:
+                    if shown[cursor].disabled:
+                        note = f"Not available: {shown[cursor].hint}"
+                        continue
+                    return shown[cursor].key
+            elif key in ("esc", "left"):
+                return None
+            elif multi and key == "space" and shown:
+                k = shown[cursor].key
+                if k in chosen:
+                    chosen.discard(k)
+                elif limit and len(chosen) >= limit:
+                    note = f"At most {limit} can be selected (MAX_TARGETED_FIREWALLS)."
+                else:
+                    chosen.add(k)
+            elif multi and key == "+":
+                for item in shown:
+                    if not limit or len(chosen) < limit:
+                        chosen.add(item.key)
+            elif multi and key == "-":
+                chosen.clear()
+            elif key == "backspace" and filterable:
+                query = query[:-1]
+            elif len(key) == 1 and key.isprintable():
+                if filterable:
+                    query, cursor, top = query + key, 0, 0
+                    continue
+                match = next((i for i in items if i.key.lower() == key.lower()), None)
+                if match and not multi:
+                    if match.disabled:
+                        note = f"Not available: {match.hint}"
+                        continue
+                    return match.key
+                if key.lower() == "q":
+                    return None
+
+    def _item_line(self, item, current, multi, on, key_width, label_width=0):
+        mark = self.s(self.g["cursor"], "1;36") if current else " "
+        box = (self.s(f"[{self.g['on']}] ", "32") if on else "[ ] ") if multi else ""
+        key = self.s(f"{item.key:>{key_width}}  ", "36") if key_width else ""
+        room = self.width - 3 - (4 if multi else 0) - (key_width + 2 if key_width else 0)
+        label = self.fit(item.label, room)
+        if item.hint:
+            label = label.ljust(label_width)
+        hint = self.fit(item.hint, room - len(label) - 3) if item.hint and room - len(label) > 8 else ""
+        style = "2" if item.disabled else ("1" if current else item.style)
+        if current and item.style and not item.disabled:
+            style = f"1;{item.style}"
+        text = self.s(label, style) + (self.s(f"   {hint}", "2") if hint else "")
+        return f" {mark} {box}{key}{text}"
+
+    def _plain_list(self, title, items, intro, head, multi, chosen, limit, filterable):
+        query = ""
+        while True:
+            shown = self._filter(items, query)
+            self.screen(title)
+            for line in intro:
+                self.write(line)
+            if head:
+                self.write((" " * 11 if multi else " " * 7) + head)
+            label_width = min(40, max([len(i.label) for i in shown if i.hint] + [0]))
+            for n, item in enumerate(shown, 1):
+                hint = f"{' ' * (label_width - len(item.label))}   {item.hint}" if item.hint else ""
+                if multi:
+                    self.write(f"  {n:>3}) [{'x' if item.key in chosen else ' '}] {item.label}{hint}")
+                else:
+                    self.write(f"  {item.key:>3}) {item.label}{hint}{'  (not available)' if item.disabled else ''}")
+            if multi:
+                tip = "numbers or ranges toggle (1,3-5), a all, n none, Enter confirm, q cancel"
+            else:
+                tip = "type a key, Enter for back"
+            if filterable:
+                tip += ", /text filters"
+            answer = self.read_line(f"  {tip}\n  > ").strip()
+            if filterable and answer.startswith("/"):
+                query = answer[1:]
+                continue
+            if multi:
+                if not answer:
+                    return [i.key for i in items if i.key in chosen]
+                if answer.lower() == "q":
+                    return None
+                if answer.lower() in ("a", "+"):
+                    chosen |= {i.key for i in shown[: limit or None]}
+                elif answer.lower() in ("n", "-"):
+                    chosen.clear()
+                else:
+                    for n in self._parse_numbers(answer, len(shown)):
+                        k = shown[n - 1].key
+                        if k in chosen:
+                            chosen.discard(k)
+                        elif not limit or len(chosen) < limit:
+                            chosen.add(k)
+                        else:
+                            self.message(f"At most {limit} can be selected.")
+                if limit and len(chosen) > limit:
+                    chosen = set(sorted(chosen, key=[i.key for i in items].index)[:limit])
+                continue
+            if not answer:
+                return None
+            match = next((i for i in items if i.key.lower() == answer.lower()), None)
+            if match and not match.disabled:
+                return match.key
+            self.message(f"Not available: {match.hint}" if match else f"Unknown choice: {answer}")
+
+    @staticmethod
+    def _parse_numbers(text, count):
+        numbers = []
+        for part in re.split(r"[,\s]+", text):
+            m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+            if m:
+                lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+                numbers += [n for n in range(lo, hi + 1) if 1 <= n <= count]
+        return numbers
+
+    def view(self, title, lines):
+        """Scrollable text view."""
+        lines = list(lines) or ["  (nothing to show)"]
+        if not self.arrows:
+            self.screen(title)
+            for line in lines:
+                self.write(line)
+            self.pause()
+            return
+        top = 0
+        while True:
+            self.screen(title)
+            rows = max(3, self.height - len(self.header()) - 6)
+            top = max(0, min(top, len(lines) - rows))
+            for line in lines[top: top + rows]:
+                self.write(line)
+            where = f"lines {top + 1}-{min(len(lines), top + rows)} of {len(lines)} · " if len(lines) > rows else ""
+            self.write("\n  " + self.s(f"{where}{self.g['updown']} scroll · Esc back", "2"))
+            key = self.read_key()
+            moves = {"up": -1, "down": 1, "pgup": -rows, "pgdn": rows, "space": rows,
+                     "home": -len(lines), "end": len(lines)}
+            if key in moves:
+                top += moves[key]
+            elif key in ("esc", "enter", "left", "backspace", "q"):
+                return
+
+
+class MenuApp:
+    """Menu-driven front end. Every Panorama call still goes through PanoramaClient and its guards."""
+
+    def __init__(self, settings, transport=None, tui=None):
+        self.settings = settings
+        self.env = replace(settings)  # values from .env: the menu can make runs lighter, never heavier
+        self.transport = transport
+        self.tui = tui or Tui()
+        self.tui.header = self.header_lines
+        self.client = PanoramaClient(settings, transport=transport, log=self.tui.write)
+        self.formats = ["html", "csv"]
+        self.cache = None
+        self.cache_errors = {}
+        self.last_run = ""
+
+    # ---- inventory that populates the menus (cached; refresh on request) ----
+
+    @property
+    def xml(self):
+        return self.settings.api_mode == "xml"
+
+    def load_inventory(self, force=False):
+        if self.cache is not None and not force:
+            return
+        self.cache, self.cache_errors = {"devices": [], "groups": [], "templates": []}, {}
+        self.tui.write(self.tui.s("  Loading inventory from Panorama (read-only)...", "2"))
+        if self.xml:
+            fetches = [("devices", self._xml_devices), ("groups", lambda: self._xml_groups("devicegroups")),
+                       ("templates", lambda: self._xml_groups("templates"))]
+        else:
+            fetches = [("groups", self._rest_groups)]
+        for key, fetch in fetches:
+            try:
+                self.cache[key] = fetch()
+            except ApiError as exc:
+                self.cache_errors[key] = str(exc)
+
+    def _xml_devices(self):
+        collector = Collector(self.client, self.settings)
+        collector.collect_devices()
+        return collector.data["devices"]
+
+    def _xml_groups(self, kind):
+        try:
+            result = self.client.op(kind)
+            return [(e.get("name"), e) for e in result.findall(f"./{kind}/entry") if e.get("name")]
+        except ApiError as exc:
+            if exc.code not in ("16", "403"):
+                raise
+        # No 'Operational Requests' permission: read the names from the config instead.
+        node = "device-group" if kind == "devicegroups" else "template"
+        names = self.client.request({"type": "config", "action": "get",
+                                     "xpath": f"{PANORAMA_DEVICE_XPATH}/{node}/entry/@name"},
+                                    f"config get {node} names")
+        return [(e.get("name"), None) for e in top_entries(names) if e.get("name")]
+
+    def _rest_groups(self):
+        entries = Collector(self.client, self.settings)._rest_device_groups()
+        return [(e.get("@name"), json_to_element("entry", e)) for e in entries if e.get("@name")]
+
+    def group_names(self):
+        return [name for name, _ in self.cache["groups"]]
+
+    def connected(self):
+        return [d for d in self.cache["devices"] if d.get("connected") == "yes"]
+
+    def mode_sections(self):
+        return list(SECTIONS if self.xml else REST_SECTIONS)
+
+    def estimate(self, sections, groups=None, templates=None, firewalls=0):
+        groups = len(self.cache["groups"]) if groups is None else groups
+        templates = len(self.cache["templates"]) if templates is None else templates
+        return estimate_calls(self.settings.api_mode, sections, groups, templates, firewalls)
+
+    # ---- layout ----
+
+    def header_lines(self):
+        t, s = self.tui, self.settings
+        dot = f" {t.g['dot']} "
+        rule = t.s(t.g["rule"] * min(t.width, 96), "2")
+        key = f"key ...{s.api_key[-4:]}" if s.api_key else t.s("no key", "31")
+        lines = [rule, " " + t.s("PANORAMA HEALTH CHECK", "1;36") + t.s("   read-only", "2"),
+                 " " + dot.join([s.host, f"{s.api_mode.upper()} API", key])]
+        if self.cache is not None:
+            parts = []
+            if self.cache["devices"]:
+                down = len(self.cache["devices"]) - len(self.connected())
+                parts.append(f"{len(self.cache['devices'])} firewalls "
+                             + (t.s(f"({down} not connected)", "31") if down else t.s("(all connected)", "32")))
+            parts.append(f"{len(self.cache['groups'])} device groups")
+            if self.xml:
+                parts.append(f"{len(self.cache['templates'])} templates")
+            lines.append(" " + dot.join(parts))
+            if self.cache_errors:
+                lines.append(" " + t.s(f"Could not read: {', '.join(self.cache_errors)} (see Diagnose)", "33"))
+        if self.last_run:
+            lines.append(" " + self.last_run)
+        lines.append(rule)
+        return lines
+
+    def _safe(self, action, *args):
+        """Run a menu action; API errors and Ctrl+C return to the menu instead of exiting."""
+        try:
+            action(*args)
+        except ApiError as exc:
+            self.tui.write()
+            for line in textwrap.wrap(str(exc), self.tui.width - 4):
+                self.tui.message(line, "31")
+            self.tui.pause()
+        except KeyboardInterrupt:
+            self.tui.write()
+            self.tui.message("Cancelled.")
+            self.tui.pause()
+
+    # ---- main menu ----
+
+    def run(self):
+        try:
+            self.load_inventory()
+        except KeyboardInterrupt:
+            pass
+        actions = {"1": self.full_check, "2": self.quick_check, "3": self.custom_check, "4": self.browse,
+                   "5": self.run_diagnose, "6": self.preview, "7": self.reports, "8": self.settings_menu,
+                   "r": lambda: self.load_inventory(force=True)}
+        while True:
+            try:
+                choice = self.tui.select("Main menu", self.main_items())
+            except KeyboardInterrupt:
+                choice = None
+            if choice in (None, "q"):
+                self.tui.write("\n  Bye.")
+                return 0
+            self._safe(actions[choice])
+
+    def main_items(self):
+        full = [s for s in self.mode_sections() if s != "targeted"]
+        groups, templates = len(self.cache["groups"]), len(self.cache["templates"])
+        dot = f" {self.tui.g['dot']} "
+        reports = self._report_dirs()
+        devices = self.cache["devices"]
+        browse_hint = (f"{len(devices)} firewalls, {groups} device groups, jobs, Panorama status" if self.xml
+                       else "needs API_MODE=xml (operational data)")
+        s = self.settings
+        return [
+            MenuItem("1", "Full health check",
+                     dot.join([f"{len(full)} sections", f"{groups} device groups", f"~{self.estimate(full)} calls"])),
+            MenuItem("2", "Quick health check",
+                     dot.join([f"shared + first {QUICK_DEVICE_GROUPS} device groups",
+                               f"~{self.estimate(full, min(groups, QUICK_DEVICE_GROUPS), min(templates, QUICK_DEVICE_GROUPS))} calls"])),
+            MenuItem("3", "Custom health check...", "choose sections, device groups, firewalls and formats"),
+            MenuItem("4", "Browse Panorama (live)", browse_hint, disabled=not self.xml),
+            MenuItem("5", "Diagnose API access", "test each permission and how the key is sent"),
+            MenuItem("6", "Preview API calls", "dry run of a full check; sends nothing"),
+            MenuItem("7", "Past reports", f"{len(reports)} in {s.output_dir}"),
+            MenuItem("8", "Session settings",
+                     dot.join([f"{s.api_mode} mode", f"delay {s.request_delay:g}s", f"logs {s.log_window_hours}h",
+                               ",".join(self.formats)])),
+            MenuItem("r", "Refresh inventory", f"re-read firewalls and groups ({'3' if self.xml else '1'}+ calls)"),
+            MenuItem("q", "Quit"),
+        ]
+
+    # ---- health checks ----
+
+    def full_check(self):
+        self.execute("Full health check", [s for s in self.mode_sections() if s != "targeted"])
+
+    def quick_check(self):
+        self.execute("Quick health check", [s for s in self.mode_sections() if s != "targeted"],
+                     max_groups=QUICK_DEVICE_GROUPS)
+
+    def preview(self):
+        self.execute("Preview: full health check", [s for s in self.mode_sections() if s != "targeted"], dry=True)
+
+    def execute(self, title, sections, dry=False, **scope):
+        self.tui.screen(title + (" (dry run, nothing is sent)" if dry else ""))
+        if not dry:
+            self.tui.message("Ctrl+C cancels.", "2")
+        client = PanoramaClient(self.settings, dry_run=True, transport=self.transport,
+                                log=self.tui.write) if dry else self.client
+        started = time.monotonic()
+        first = len(client.calls)
+        data, findings, out_dir = run_health_check(client, self.settings, sections, self.formats, **scope)
+        calls = len(client.calls) - first
+        if dry:
+            self.tui.write(f"\n  Preview complete: {calls} calls listed, nothing sent.")
+            self.tui.pause()
+            return
+        sev = Counter(f["severity"] for f in findings)
+        self.last_run = self.tui.s(f"Last run {out_dir.name}: ", "2") + "  ".join(
+            self.tui.s(f"{name} {sev[name]}", SEV_STYLE[name]) for name in ("critical", "high", "medium") if sev[name]
+        ) if findings else ""
+        self.results(data, findings, out_dir, calls, time.monotonic() - started)
+
+    def results(self, data, findings, out_dir, calls, elapsed):
+        t = self.tui
+        dot = f" {t.g['dot']} "
+        sev = Counter(f["severity"] for f in findings)
+        intro = ["  " + t.s("Health check complete", "1;32") + dot + dot.join(
+                     [f"{calls} read-only calls", f"{elapsed:.0f}s", f"{len(data['devices'])} firewalls"]),
+                 "  " + t.s(f"Report: {out_dir}", "2"), "",
+                 "  " + "   ".join(t.s(f"{name.upper()} {sev[name]}", SEV_STYLE[name] if sev[name] else "2")
+                                   for name in SEVERITY_ORDER)]
+        if data.get("scope_note"):
+            intro.append("  " + t.s(data["scope_note"], "33"))
+        if data["errors"]:
+            intro.append("  " + t.s(f"{len(data['errors'])} part(s) could not be collected; see collection errors",
+                                    "33"))
+        top = [f for f in findings if f["severity"] != "info"][:8]
+        if top:
+            intro += ["", "  " + t.s("Top findings", "1")]
+            intro += ["  " + t.s(f"{f['severity']:<9}", SEV_STYLE[f["severity"]])
+                      + t.fit(f"{t.fit(f['target'], 24):<24}  {f['finding']}", t.width - 14) for f in top]
+        rules = rule_findings(data["rules"])
+        html_path = out_dir / "report.html"
+        while True:
+            items = [
+                MenuItem("o", "Open HTML report", str(html_path) if html_path.exists() else "HTML format was off",
+                         disabled=not html_path.exists()),
+                MenuItem("f", f"View all findings ({len(findings)})"),
+                MenuItem("r", f"View rule findings ({len(rules)})", disabled=not rules, hint="" if rules else "none"),
+                MenuItem("e", f"View collection errors ({len(data['errors'])})", disabled=not data["errors"],
+                         hint="" if data["errors"] else "none"),
+                MenuItem("d", "Open report folder"),
+                MenuItem("b", "Back to main menu"),
+            ]
+            choice = t.select("Results", items, intro=intro)
+            if choice in (None, "b"):
+                return
+            if choice == "o":
+                _open_path(html_path)
+            elif choice == "f":
+                t.view("All findings", t.table_lines(findings, FINDING_COLS, self._sev_style))
+            elif choice == "r":
+                t.view("Rule findings", t.table_lines(rules, RULE_FINDING_COLS, self._sev_style))
+            elif choice == "e":
+                t.view("Collection errors", self._error_lines(data["errors"]))
+            elif choice == "d":
+                _open_path(out_dir)
+
+    @staticmethod
+    def _sev_style(row):
+        return SEV_STYLE.get(row.get("severity", ""), "")
+
+    def _error_lines(self, errors):
+        lines = []
+        for err in errors:
+            lines.append("  " + self.tui.s(err["section"], "1;31"))
+            lines += ["    " + part for part in textwrap.wrap(err["error"], self.tui.width - 6)] + [""]
+        return lines
+
+    def custom_check(self):
+        t = self.tui
+        available = self.mode_sections()
+        items = [MenuItem(s, f"{s:<13}", SECTION_INFO[s]) for s in available]
+        sections = t.checklist("Custom health check 1/4: sections", items,
+                               selected=[s for s in available if s != "targeted"])
+        if not sections:
+            return
+        scope = {}
+        groups, templates, firewalls = len(self.cache["groups"]), len(self.cache["templates"]), 0
+        if "rules" in sections and self.cache["groups"]:
+            names = self.group_names()
+            members = {name: len(el.findall("./devices/entry")) for name, el in self.cache["groups"] if el is not None}
+            picked = t.checklist(
+                "Custom health check 2/4: device groups for security rules (shared is always included)",
+                [MenuItem(n, n, f"{members[n]} firewalls" if n in members else "") for n in names],
+                selected=names, filterable=True)
+            if picked is None:
+                return
+            if len(picked) < len(names):
+                scope["only_groups"], scope["max_groups"] = picked, len(picked)
+            groups = len(picked)
+        if "targeted" in sections:
+            connected = self.connected()
+            if not connected:
+                t.message("No connected firewalls are known, so live per-firewall checks are skipped.")
+                t.pause()
+                sections.remove("targeted")
+            else:
+                cap = self.settings.max_targeted
+                head, fw_items = t.table_items(connected, ["hostname", "serial", "model", "sw-version", "ha/state"])
+                for item, dev in zip(fw_items, connected):
+                    item.key = dev.get("serial", "")
+                picked = t.checklist(f"Custom health check 3/4: firewalls for live checks (max {cap}, "
+                                     f"{len(TARGETED_CALLS)} calls each)", fw_items,
+                                     selected=[d.get("serial", "") for d in connected[:cap]], limit=cap,
+                                     head=head, filterable=True)
+                if picked is None:
+                    return
+                if picked:
+                    scope["only_serials"], firewalls = picked, len(picked)
+                else:
+                    sections.remove("targeted")
+        formats = t.checklist("Custom health check 4/4: report formats",
+                              [MenuItem("html", "HTML report", "report.html, one self-contained page"),
+                               MenuItem("csv", "CSV files", "one file per table, for Excel")],
+                              selected=self.formats)
+        if not formats:
+            return
+        estimate = self.estimate(sections, groups, templates, firewalls)
+        dot = f" {t.g['dot']} "
+        groups_text = (", ".join(scope["only_groups"]) or "shared only") if "only_groups" in scope else "all"
+        rows = [("Sections", ", ".join(sections)),
+                ("Device groups", groups_text if "rules" in sections else ""),
+                ("Firewalls", ", ".join(scope.get("only_serials", [])) if "targeted" in sections else ""),
+                ("Formats", ", ".join(formats)),
+                ("Estimate", f"~{estimate} read-only API calls{dot}{self.settings.request_delay:g}s apart{dot}"
+                             f"~{estimate * max(self.settings.request_delay, 0.5):.0f}s or more")]
+        intro = [f"  {t.s(f'{label:<14}', '2')} {value}" for label, value in rows if value]
+        saved, self.formats = self.formats, formats
+        try:
+            while True:
+                choice = t.select("Custom health check: ready", [
+                    MenuItem("r", "Run now"), MenuItem("p", "Preview the exact calls (dry run)"),
+                    MenuItem("b", "Cancel")], intro=intro)
+                if choice == "p":
+                    self.execute("Preview: custom health check", list(sections), dry=True, **scope)
+                    continue
+                if choice == "r":
+                    self.execute("Custom health check", list(sections), **scope)
+                return
+        finally:
+            self.formats = saved
+
+    def run_diagnose(self):
+        self.tui.screen("Diagnose API access")
+        diagnose(self.client)
+        self.tui.pause()
+
+    # ---- browse (live, read-only) ----
+
+    def browse(self):
+        while True:
+            devices, dot = self.cache["devices"], f" {self.tui.g['dot']} "
+            down = len(devices) - len(self.connected())
+            items = [
+                MenuItem("f", f"Firewalls ({len(devices)})", f"{down} not connected" if down else "all connected",
+                         style="31" if down else ""),
+                MenuItem("g", f"Device groups ({len(self.cache['groups'])})", "members and policy sync; collect rules"),
+                MenuItem("t", f"Templates ({len(self.cache['templates'])})", "members and template sync"),
+                MenuItem("j", "Recent jobs", f"last {self.settings.max_jobs} commit/push jobs (1 call)"),
+                MenuItem("l", "Log collectors", "connectivity (1 call)"),
+                MenuItem("p", "Panorama status", "version, HA, CPU, memory, disk, NTP (5 calls)"),
+                MenuItem("r", "Refresh inventory", "3 calls"),
+                MenuItem("b", "Back"),
+            ]
+            choice = self.tui.select("Browse Panorama (live, read-only)", items)
+            if choice in (None, "b"):
+                return
+            action = {"f": self.browse_firewalls, "g": lambda: self.browse_groups("groups"),
+                      "t": lambda: self.browse_groups("templates"), "j": self.browse_jobs,
+                      "l": self.browse_collectors, "p": self.panorama_status,
+                      "r": lambda: self.load_inventory(force=True)}[choice]
+            self._safe(action)
+
+    def browse_firewalls(self):
+        t = self.tui
+        devices = self.cache["devices"]
+        if not devices:
+            t.message(self.cache_errors.get("devices", "No firewalls found."))
+            t.pause()
+            return
+        cols = ["hostname", "serial", "model", "ip-address", "connected", "sw-version", "ha/state"]
+        head, items = t.table_items(devices, cols, style=lambda d: "" if d.get("connected") == "yes" else "31")
+        while True:
+            choice = t.select(f"Firewalls ({len(devices)})", items, head=head, filterable=True, show_keys=False)
+            if choice is None:
+                return
+            self._safe(self.firewall_detail, devices[int(choice) - 1])
+
+    def firewall_detail(self, dev):
+        t = self.tui
+        name = dev.get("hostname") or dev.get("serial", "")
+        fields = [c for c in INVENTORY_COLS if dev.get(c)]
+        fields += sorted(k for k in dev if "policy-status" in k or "template-status" in k)
+        pad = min(40, max(len(c) for c in fields)) if fields else 0
+        intro = [f"  {t.s(f'{c:<{pad}}', '2')}  {t.s(dev[c], '31' if c == 'connected' and dev[c] != 'yes' else '')}"
+                 for c in fields]
+        data = Collector(None, self.settings).data
+        data["devices"] = [dev]
+        found = evaluate(data)
+        if found:
+            intro += ["", "  " + t.s("Findings", "1")]
+            intro += ["  " + t.s(f"{f['severity']:<9}", SEV_STYLE[f["severity"]]) + f["finding"] for f in found]
+        connected = dev.get("connected") == "yes"
+        while True:
+            choice = t.select(f"Firewall {name}", [
+                MenuItem("l", "Live status", f"{len(TARGETED_CALLS)} read-only calls through Panorama"
+                         if connected else "the firewall is not connected", disabled=not connected),
+                MenuItem("a", f"All fields ({len(dev)})"),
+                MenuItem("b", "Back")], intro=intro)
+            if choice in (None, "b"):
+                return
+            if choice == "a":
+                t.view(f"Firewall {name}: all fields",
+                       [f"  {t.s(t.fit(k, 40).ljust(40), '2')} {v}" for k, v in sorted(dev.items())])
+            else:
+                self._safe(self.live_status, dev)
+
+    def live_status(self, dev):
+        t = self.tui
+        serial, name = dev.get("serial", ""), dev.get("hostname") or dev.get("serial", "")
+        t.screen(f"Live status: {name}")
+        collector = Collector(self.client, self.settings, only_serials=[serial])
+        collector.data["devices"] = self.cache["devices"]
+        collector.collect_targeted()
+        data = Collector(None, self.settings).data
+        data["resources"], data["disk"] = collector.data["resources"], collector.data["disk"]
+        row = data["resources"][0] if data["resources"] else {}
+        limits = {f: limit for f, _, limit in LOAD_LIMITS}
+        labels = [("ha_enabled", "HA enabled"), ("ha_local_state", "HA local state"),
+                  ("ha_peer_state", "HA peer state"), ("ha_peer_conn", "HA peer connection"),
+                  ("num-active", "Active sessions"), ("num-max", "Session capacity"),
+                  ("session_util_pct", "Session table %"), ("cps", "Connections/s"), ("kbps", "Throughput kbps"),
+                  ("mgmt_cpu_pct", "Management CPU %"), ("mgmt_mem_pct", "Management memory %"),
+                  ("dp_cpu_pct", "Dataplane CPU %"), ("packet_buffer_pct", "Packet buffer %")]
+        lines = []
+        for field_name, label in labels:
+            value = row.get(field_name, "")
+            style = ""
+            try:
+                if field_name in limits:
+                    style = "1;31" if float(value) >= limits[field_name] else "32"
+            except ValueError:
+                pass
+            lines.append(f"  {t.s(f'{label:<22}', '2')} {t.s(value or '-', style)}")
+        if data["disk"]:
+            lines += ["", "  " + t.s("Disk", "1")]
+            lines += t.table_lines(data["disk"], ["mount", "use_pct", "size", "used", "avail"],
+                                   lambda d: "31" if int(d["use_pct"]) >= 90 and "panlogs" not in d["mount"] else "")
+        found = evaluate(data)
+        if found:
+            lines += ["", "  " + t.s("Findings", "1")]
+            lines += ["  " + t.s(f"{f['severity']:<9}", SEV_STYLE[f["severity"]]) + t.fit(f["finding"], t.width - 14)
+                      for f in found]
+        if row.get("error"):
+            lines += [""] + self._error_lines([{"section": "errors", "error": row["error"]}])
+        t.view(f"Live status: {name}", lines)
+
+    def browse_groups(self, kind):
+        t = self.tui
+        label = "Device groups" if kind == "groups" else "Templates"
+        sync_kind = "device-group" if kind == "groups" else "template"
+        entries = self.cache[kind]
+        if not entries:
+            t.message(self.cache_errors.get(kind, f"No {label.lower()} found."))
+            t.pause()
+            return
+        rows = []
+        for name, el in entries:
+            members = Collector._sync_rows(sync_kind, [el]) if el is not None else None
+            rows.append({"name": name, "members": members,
+                         "firewalls": "?" if members is None else len(members),
+                         "connected": "?" if members is None else sum(1 for m in members if m["connected"] == "yes"),
+                         "out of sync": "?" if members is None else sum(1 for m in members if self._out_of_sync(m))})
+        head, items = t.table_items(rows, ["name", "firewalls", "connected", "out of sync"],
+                                    style=lambda r: "33" if r["out of sync"] not in (0, "?") else "")
+        while True:
+            choice = t.select(f"{label} ({len(rows)})", items, head=head, filterable=True, show_keys=False)
+            if choice is None:
+                return
+            self._safe(self.group_detail, rows[int(choice) - 1], kind)
+
+    @staticmethod
+    def _out_of_sync(member):
+        return any("out of sync" in v.lower() or "out-of-sync" in v.lower() for k, v in member.items()
+                   if k not in ("type", "group", "hostname", "serial", "connected"))
+
+    def group_detail(self, row, kind):
+        t = self.tui
+        members = row["members"] or []
+        status_cols = sorted({k for m in members for k in m if "status" in k})
+        member_lines = t.table_lines(members, ["hostname", "serial", "connected"] + status_cols,
+                                     lambda m: "31" if m["connected"] != "yes" else ("33" if self._out_of_sync(m) else ""))
+        items = [MenuItem("m", f"Members ({len(members)})", disabled=not members,
+                          hint="" if members else "membership needs 'Operational Requests'")]
+        if kind == "groups":
+            items.append(MenuItem("r", "Collect security rules for this device group",
+                                  "2 calls, report written like any other run"))
+        items.append(MenuItem("b", "Back"))
+        intro = member_lines[:8] + ([f"  {t.s(f'... {len(members) - 7} more', '2')}"] if len(members) > 7 else [])
+        while True:
+            choice = t.select(f"{'Device group' if kind == 'groups' else 'Template'} {row['name']}", items, intro=intro)
+            if choice in (None, "b"):
+                return
+            if choice == "m":
+                t.view(f"Members of {row['name']}", member_lines)
+            else:
+                self.execute(f"Security rules: {row['name']}", ["rules"], only_groups=[row["name"]], max_groups=1)
+
+    def browse_jobs(self):
+        t = self.tui
+        t.screen("Recent jobs")
+        collector = Collector(self.client, self.settings)
+        collector.collect_jobs()
+        jobs = collector.data["jobs"]
+        if not jobs:
+            t.message("No jobs.")
+            t.pause()
+            return
+
+        def failed(job):
+            return job.get("result", "").upper() == "FAIL" or job.get("devices_failed", "0") not in ("", "0")
+
+        head, items = t.table_items(jobs, ["id", "type", "status", "result", "tfin", "user", "devices_failed"],
+                                    style=lambda j: "31" if failed(j) else "")
+        while True:
+            choice = t.select(f"Recent jobs ({len(jobs)}, {sum(map(failed, jobs))} failed)", items, head=head,
+                              filterable=True, show_keys=False)
+            if choice is None:
+                return
+            job = jobs[int(choice) - 1]
+            lines = []
+            for k, v in job.items():
+                wrapped = textwrap.wrap(str(v), t.width - 26) or [""]
+                lines.append(f"  {t.s(f'{k:<20}', '2')} {wrapped[0]}")
+                lines += [" " * 23 + part for part in wrapped[1:]]
+            t.view(f"Job {job.get('id', '')}", lines)
+
+    def browse_collectors(self):
+        t = self.tui
+        t.screen("Log collectors")
+        collector = Collector(self.client, self.settings)
+        collector.collect_collectors()
+        rows = collector.data["log_collectors"]
+        t.view(f"Log collectors ({len(rows)})",
+               t.table_lines(rows, columns_for(rows, ["serial", "host-name", "connected"])[:8],
+                             lambda r: "31" if r.get("connected", "yes") != "yes" else ""))
+
+    def panorama_status(self):
+        t = self.tui
+        t.screen("Panorama status")
+        collector = Collector(self.client, self.settings)
+        collector.collect_panorama()
+        data = collector.data
+        pano, ha = data["panorama"], data["panorama_ha"]
+        lines = [f"  {t.s(f'{k:<22}', '2')} {pano[k]}" for k in
+                 ("hostname", "ip-address", "model", "serial", "sw-version", "uptime", "system-mode",
+                  "app-version", "av-version", "wildfire-version", "time") if pano.get(k)]
+        extra = [("HA enabled", ha.get("enabled", "")), ("HA local state", _ends(ha, "local-info/state")),
+                 ("HA peer state", _ends(ha, "peer-info/state")), ("HA peer connection", _ends(ha, "peer-info/conn-status")),
+                 ("HA running config", _ends(ha, "running-sync")),
+                 ("Management CPU %", data["panorama_resources"].get("mgmt_cpu_pct", "")),
+                 ("Management memory %", data["panorama_resources"].get("mgmt_mem_pct", "")),
+                 ("NTP synched to", data["panorama_ntp"].get("ntp_synched", "")),
+                 ("NTP servers", data["panorama_ntp"].get("ntp_servers", ""))]
+        lines += [f"  {t.s(f'{k:<22}', '2')} {v}" for k, v in extra if v]
+        if data["disk"]:
+            lines += ["", "  " + t.s("Disk", "1")]
+            lines += t.table_lines(data["disk"], ["mount", "use_pct", "size", "used", "avail"],
+                                   lambda d: "31" if int(d["use_pct"]) >= 90 and "panlogs" not in d["mount"] else "")
+        found = [f for f in evaluate(data) if f["area"] in ("panorama", "disk")]
+        lines += ["", "  " + t.s("Findings", "1")]
+        lines += ["  " + t.s(f"{f['severity']:<9}", SEV_STYLE[f["severity"]]) + t.fit(f["finding"], t.width - 14)
+                  for f in found] or ["  " + t.s("No Panorama findings.", "32")]
+        if data["errors"]:
+            lines += [""] + self._error_lines(data["errors"])
+        t.view("Panorama status", lines)
+
+    # ---- past reports ----
+
+    def _report_dirs(self):
+        root = self.settings.output_dir
+        if not root.is_dir():
+            return []
+        return sorted((p for p in root.iterdir() if p.is_dir() and REPORT_DIR_RE.fullmatch(p.name)), reverse=True)
+
+    def reports(self):
+        t = self.tui
+        runs = self._report_dirs()[:100]
+        if not runs:
+            t.message(f"No reports yet in {self.settings.output_dir}.")
+            t.pause()
+            return
+        rows = []
+        for path in runs:
+            sev = Counter(r.get("severity", "") for r in _read_csv(path / "findings.csv"))
+            rows.append({"when": datetime.strptime(path.name, "%Y%m%d-%H%M%S").strftime("%Y-%m-%d %H:%M:%S"),
+                         "firewalls": len(_read_csv(path / "inventory.csv")), "critical": sev["critical"],
+                         "high": sev["high"], "medium": sev["medium"], "low": sev["low"],
+                         "html": "yes" if (path / "report.html").exists() else "no"})
+        head, items = t.table_items(rows, ["when", "firewalls", "critical", "high", "medium", "low", "html"],
+                                    style=lambda r: "31" if r["critical"] else ("38;5;208" if r["high"] else ""))
+        while True:
+            choice = t.select(f"Past reports ({len(rows)}, newest first)", items, head=head, filterable=True,
+                              show_keys=False)
+            if choice is None:
+                return
+            self.report_actions(runs[int(choice) - 1])
+
+    def report_actions(self, path):
+        t = self.tui
+        html_path = path / "report.html"
+        findings = _read_csv(path / "findings.csv")
+        while True:
+            choice = t.select(f"Report {path.name}", [
+                MenuItem("o", "Open HTML report", "" if html_path.exists() else "no HTML in this run",
+                         disabled=not html_path.exists()),
+                MenuItem("f", f"View findings ({len(findings)})"),
+                MenuItem("d", "Open report folder", str(path)),
+                MenuItem("b", "Back")])
+            if choice in (None, "b"):
+                return
+            if choice == "o":
+                _open_path(html_path)
+            elif choice == "f":
+                t.view(f"Findings {path.name}", t.table_lines(findings, FINDING_COLS, self._sev_style))
+            else:
+                _open_path(path)
+
+    # ---- session settings ----
+
+    def settings_menu(self):
+        t, s, env = self.tui, self.settings, self.env
+        while True:
+            other = "rest" if self.xml else "xml"
+            other_key = getattr(s, f"{other}_api_key")
+            items = [
+                MenuItem("m", f"API mode: {s.api_mode}",
+                         f"switch to {other}" if other_key else f"{API_KEY_VARS[other]} is empty in .env",
+                         disabled=not other_key),
+                MenuItem("f", f"Report formats: {', '.join(self.formats)}"),
+                MenuItem("d", f"Request delay: {s.request_delay:g}s", f"minimum {env.request_delay:g}s from .env"),
+                MenuItem("w", f"Log window: {s.log_window_hours}h", "1-168 hours"),
+                MenuItem("l", f"Max logs per query: {s.max_logs}", f"1-{env.max_logs}"),
+                MenuItem("j", f"Max jobs kept: {s.max_jobs}", "1-500"),
+                MenuItem("t", f"Max firewalls for live checks: {s.max_targeted}", f"1-{env.max_targeted} (.env cap)"),
+                MenuItem("i", "Connection details", "host, TLS, proxy, keys"),
+                MenuItem("b", "Back"),
+            ]
+            choice = t.select("Session settings (this session only; edit .env to keep them)", items)
+            if choice in (None, "b"):
+                return
+            if choice == "m":
+                s.api_mode = other
+                self.load_inventory(force=True)
+            elif choice == "f":
+                picked = t.checklist("Report formats", [MenuItem("html", "HTML report"), MenuItem("csv", "CSV files")],
+                                     selected=self.formats)
+                if picked:
+                    self.formats = picked
+            elif choice == "d":
+                s.request_delay = self._ask_number("Request delay in seconds", s.request_delay,
+                                                   env.request_delay, 30, float)
+            elif choice == "w":
+                s.log_window_hours = self._ask_number("Log window in hours", s.log_window_hours, 1, 168)
+            elif choice == "l":
+                s.max_logs = self._ask_number("Max logs per query", s.max_logs, 1, env.max_logs)
+            elif choice == "j":
+                s.max_jobs = self._ask_number("Max jobs kept", s.max_jobs, 1, 500)
+            elif choice == "t":
+                s.max_targeted = self._ask_number("Max firewalls for live checks", s.max_targeted,
+                                                  1, max(1, env.max_targeted))
+            else:
+                t.view("Connection details", self._connection_lines())
+
+    def _ask_number(self, label, current, lo, hi, cast=int):
+        text = self.tui.prompt(f"{label} ({lo:g}-{hi:g})", f"{current:g}")
+        try:
+            value = cast(text)
+        except ValueError:
+            value = None
+        if value is None or not lo <= value <= hi:
+            self.tui.message(f"Must be a number from {lo:g} to {hi:g}; kept {current:g}.")
+            self.tui.pause()
+            return current
+        return value
+
+    def _connection_lines(self):
+        t, s = self.tui, self.settings
+        rows = [("Panorama", f"https://{s.host}:{s.port}"), ("Allowed hosts (.env)", ", ".join(s.allowed_hosts)),
+                ("TLS verification", "on" if s.verify_tls else t.s("off (lab only)", "33")),
+                ("CA bundle", s.ca_bundle or "-"), ("Bypass proxy", "yes" if s.bypass_proxy else "no"),
+                ("REST version", s.rest_version),
+                ("XML key", replace(s, api_mode="xml").key_label()),
+                ("REST key", replace(s, api_mode="rest").key_label()),
+                ("Output folder", str(s.output_dir)), ("Calls this session", str(len(self.client.calls)))]
+        lines = []
+        for label, value in rows:
+            wrapped = textwrap.wrap(value, t.width - 28) or [""]
+            lines.append(f"  {t.s(f'{label:<24}', '2')} {wrapped[0]}")
+            lines += [" " * 27 + part for part in wrapped[1:]]
+        return lines
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Read-only Panorama health-check collector (proof of concept).")
+    p = argparse.ArgumentParser(description="Read-only Panorama health-check collector (proof of concept). "
+                                            "Run with no options for the interactive menu.")
     p.add_argument("--env", default=str(SCRIPT_DIR / ".env"), help="path to the .env file")
+    p.add_argument("--menu", action="store_true", help="open the interactive menu (default when run with no options)")
     p.add_argument("--dry-run", action="store_true", help="print the API calls that would be made; send nothing")
     p.add_argument("--diagnose", action="store_true", help="test API access and permissions, then exit")
     p.add_argument("--sections", default=",".join(SECTIONS),
                    help=f"comma-separated sections to collect (default: all). Choices: {','.join(SECTIONS)}")
     p.add_argument("--targeted", action="store_true",
                    help="also query each connected firewall through Panorama (overrides ENABLE_TARGETED)")
+    p.add_argument("--firewalls", default="",
+                   help="comma-separated serials for the live per-firewall checks (implies --targeted)")
     p.add_argument("--format", default="html,csv", help="html, csv or html,csv (default)")
     p.add_argument("--output-dir", help="override OUTPUT_DIR")
     p.add_argument("--quick", action="store_true",
@@ -1698,7 +2815,29 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
+def run_health_check(client, settings, sections, formats, only_groups=None, max_groups=None, only_serials=None):
+    """Collect, evaluate and write the report. Returns (data, findings, out_dir); out_dir is None on a dry run."""
+    started = datetime.now()
+    first_call = len(client.calls)
+    collector = Collector(client, settings, only_groups=only_groups, max_groups=max_groups, only_serials=only_serials)
+    data = collector.run(sections)
+    if client.dry_run:
+        return data, [], None
+
+    findings = evaluate(data)
+    out_dir = settings.output_dir / started.strftime("%Y%m%d-%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if "csv" in formats:
+        for filename, (rows, cols) in csv_tables(data, findings).items():
+            write_csv(out_dir / filename, rows, cols)
+    if "html" in formats:
+        write_html(out_dir / "report.html", data, findings, settings, client.calls[first_call:], started)
+    return data, findings, out_dir
+
+
 def main(argv=None, transport=None):
+    if argv is None:
+        argv = sys.argv[1:]
     args = parse_args(argv)
     try:
         settings = load_settings(args.env, require_key=not args.dry_run)
@@ -1708,12 +2847,21 @@ def main(argv=None, transport=None):
     if args.output_dir:
         settings.output_dir = Path(args.output_dir)
 
+    if args.menu and (args.dry_run or args.diagnose):
+        # The menu talks to Panorama as soon as it opens; never let it run when asked for a dry run.
+        print("--menu cannot be combined with --dry-run or --diagnose (both are options inside the menu)",
+              file=sys.stderr)
+        return 2
+    if args.menu or (not argv and sys.stdin.isatty() and sys.stdout.isatty()):
+        return MenuApp(settings, transport=transport).run()
+
     sections = [s.strip() for s in args.sections.split(",") if s.strip()]
     unknown = set(sections) - set(SECTIONS)
     if unknown:
         print(f"Unknown sections: {', '.join(sorted(unknown))}", file=sys.stderr)
         return 2
-    if "targeted" in sections and not (args.targeted or settings.enable_targeted):
+    only_serials = [s.strip() for s in args.firewalls.split(",") if s.strip()]
+    if "targeted" in sections and not (args.targeted or only_serials or settings.enable_targeted):
         sections.remove("targeted")
     formats = {f.strip().lower() for f in args.format.split(",") if f.strip()}
     if not formats or formats - {"html", "csv"}:
@@ -1734,24 +2882,14 @@ def main(argv=None, transport=None):
     if args.dry_run:
         print(f"Dry run against {settings.host}: planned read-only calls\n")
 
-    started = datetime.now()
     only_groups = [g.strip() for g in args.device_groups.split(",") if g.strip()]
-    collector = Collector(client, settings, only_groups=only_groups,
-                          max_groups=QUICK_DEVICE_GROUPS if args.quick else None)
-    data = collector.run(sections)
+    data, findings, out_dir = run_health_check(
+        client, settings, sections, formats, only_groups=only_groups,
+        max_groups=QUICK_DEVICE_GROUPS if args.quick else None, only_serials=only_serials)
 
     if args.dry_run:
         print(f"\nDry run complete: {len(client.calls)} calls listed, nothing sent, no report written.")
         return 0
-
-    findings = evaluate(data)
-    out_dir = settings.output_dir / started.strftime("%Y%m%d-%H%M%S")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if "csv" in formats:
-        for filename, (rows, cols) in csv_tables(data, findings).items():
-            write_csv(out_dir / filename, rows, cols)
-    if "html" in formats:
-        write_html(out_dir / "report.html", data, findings, settings, client.calls, started)
 
     sev = Counter(f["severity"] for f in findings)
     print(f"\nDone: {len(client.calls)} read-only API calls, {len(data['devices'])} firewalls, "

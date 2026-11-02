@@ -635,6 +635,18 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual([e["section"] for e in data["errors"]], ["devices"])
         self.assertIn("does not allow 'Operational Requests'", out.getvalue())
 
+    def test_menu_refuses_dry_run_and_diagnose(self):
+        for flag in ("--dry-run", "--diagnose"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                code, fake, _, _ = self.run_main("--menu", flag)
+            self.assertEqual((code, fake.sent), (2, []), flag)
+
+    def test_firewalls_option_limits_live_checks(self):
+        code, fake, _, stdout = self.run_main("--firewalls", "002", "--sections", "devices,targeted")
+        self.assertEqual(code, 0, stdout)
+        targets = {p.get("target") for p, _ in fake.sent if p.get("target")}
+        self.assertEqual(targets, {"002"})
+
     def test_dry_run_sends_nothing(self):
         code, fake, out_dir, stdout = self.run_main("--dry-run", "--targeted")
         self.assertEqual(code, 0)
@@ -643,6 +655,135 @@ class EndToEndTests(unittest.TestCase):
                      "op dp_resources target=<serial>"):
             self.assertIn(call, stdout)
         self.assertEqual(list(out_dir.glob("2*")), [])
+
+
+class MenuTests(unittest.TestCase):
+    """Drive the interactive menu with scripted input (numbered mode) or keypresses (arrow mode)."""
+
+    def make_app(self, inputs, **overrides):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.out_dir = Path(tmp.name)
+        script = iter(inputs)
+
+        def read_line(prompt=""):
+            try:
+                return next(script)
+            except StopIteration:
+                raise AssertionError("menu asked for more input than the test scripted") from None
+
+        self.fake = FakePanorama()
+        self.screen = io.StringIO()
+        settings = make_settings(output_dir=self.out_dir, **overrides)
+        return ph.MenuApp(settings, transport=self.fake, tui=ph.Tui(out=self.screen, read_line=read_line))
+
+    def run_app(self, app):
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(ph.time, "sleep"):
+            self.assertEqual(app.run(), 0)
+        return self.screen.getvalue()
+
+    def op_calls(self):
+        return [(next(k for k, v in ph.OP_COMMANDS.items() if v == p["cmd"]), p.get("target"))
+                for p, _ in self.fake.sent if p.get("type") == "op"]
+
+    def test_menu_is_populated_from_panorama(self):
+        screen = self.run_app(self.make_app(["q"]))
+        self.assertEqual(self.op_calls(), [("devices_all", None), ("devicegroups", None), ("templates", None)])
+        for text in ("3 firewalls (1 not connected)", "1 device groups", "1 templates",
+                     "Full health check", "~21 calls", "Bye."):
+            self.assertIn(text, screen)
+
+    def test_quick_check_writes_report_and_shows_results(self):
+        screen = self.run_app(self.make_app(["2", "f", "", "b", "q"]))
+        self.assertIn("Health check complete", screen)
+        self.assertIn("Top findings", screen)
+        self.assertIn("Firewall not connected to Panorama", screen)
+        report = next(p for p in self.out_dir.iterdir() if p.is_dir())
+        self.assertTrue((report / "report.html").exists())
+        self.assertNotIn("SECRET-KEY", (report / "report.html").read_text(encoding="utf-8"))
+
+    def test_custom_check_uses_picked_sections_and_firewalls(self):
+        # sections: none, then rules (6) + targeted (9); all device groups; firewalls capped at 1:
+        # trying to add fw-b (2) is refused; both formats; run; back; quit.
+        app = self.make_app(["3", "n", "6,9", "", "", "2", "", "", "r", "b", "q"], max_targeted=1)
+        screen = self.run_app(app)
+        self.assertIn("At most 1 can be selected", screen)
+        targeted = {target for _, target in self.op_calls() if target}
+        self.assertEqual(targeted, {"001"})
+        xpaths = [p.get("xpath", "") for p, _ in self.fake.sent if p.get("type") == "config"]
+        self.assertTrue(any("DG-Branch" in x and "pre-rulebase" in x for x in xpaths))
+        self.assertFalse(any("certificate" in x for x in xpaths))
+
+    def test_browse_firewall_live_status(self):
+        screen = self.run_app(self.make_app(["4", "f", "1", "l", "", "b", "", "b", "q"]))
+        self.assertIn("Live status: fw-a", screen)
+        self.assertIn("Dataplane CPU %", screen)
+        self.assertIn("61.3", screen)
+        self.assertEqual({t for _, t in self.op_calls() if t}, {"001"})
+
+    def test_browse_device_group_and_jobs(self):
+        screen = self.run_app(self.make_app(["4", "g", "1", "m", "", "b", "", "j", "2", "", "", "b", "q"]))
+        self.assertIn("Device group DG-Branch", screen)
+        self.assertIn("Recent jobs (2, 1 failed)", screen)
+        self.assertIn("Job 41", screen)
+
+    def test_rest_mode_disables_browse(self):
+        screen = self.run_app(self.make_app(["4", "q"], api_mode="rest"))
+        self.assertIn("Not available: needs API_MODE=xml", screen)
+        self.assertTrue(all(h["X-PAN-KEY"] == "REST-KEY" for _, h in self.fake.sent))
+
+    def test_settings_never_exceed_env_limits(self):
+        app = self.make_app(["8", "t", "50", "", "d", "0.2", "", "w", "48", "m", "b", "q"], request_delay=1.0)
+        self.run_app(app)
+        self.assertEqual((app.settings.max_targeted, app.settings.request_delay), (5, 1.0))
+        self.assertEqual(app.settings.log_window_hours, 48)
+        self.assertEqual(app.settings.api_mode, "rest")  # switched; the REST key is set
+
+    def test_past_reports(self):
+        screen = self.run_app(self.make_app(["2", "b", "7", "1", "f", "", "b", "", "q"]))
+        self.assertIn("Past reports (1, newest first)", screen)
+        self.assertIn("Findings 2", screen)  # report folder names start with the year
+
+    def test_estimate_matches_a_real_run(self):
+        sections = [s for s in ph.SECTIONS if s != "targeted"]
+        fake = FakePanorama()
+        client = ph.PanoramaClient(make_settings(), transport=fake, log=lambda *_: None)
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(ph.time, "sleep"):
+            ph.Collector(client, make_settings()).run(sections)
+        self.assertEqual(len(fake.sent), ph.estimate_calls("xml", sections, groups=1, templates=1))
+        self.assertEqual(ph.estimate_calls("rest", ["devices", "rules"], groups=3), 10)
+
+
+class TuiKeyTests(unittest.TestCase):
+    items = [ph.MenuItem("a", "fw-a"), ph.MenuItem("b", "fw-b"), ph.MenuItem("c", "fw-c", disabled=True, hint="off")]
+
+    def tui(self, keys):
+        return ph.Tui(out=io.StringIO(), keys=keys)
+
+    def test_arrow_select_and_hotkey(self):
+        self.assertEqual(self.tui(["down", "enter"]).select("t", self.items), "b")
+        self.assertEqual(self.tui(["up", "up", "enter"]).select("t", self.items), "b")  # wraps around
+        self.assertEqual(self.tui(["b"]).select("t", self.items), "b")
+        self.assertIsNone(self.tui(["esc"]).select("t", self.items))
+        tui = self.tui(["c", "a"])  # a disabled item is refused; the next key still works
+        self.assertEqual(tui.select("t", self.items), "a")
+        self.assertIn("Not available: off", tui.out.getvalue())
+
+    def test_type_to_filter(self):
+        self.assertEqual(self.tui(["f", "w", "-", "b", "enter"]).select("t", self.items, filterable=True), "b")
+
+    def test_checklist_toggle_all_none_and_limit(self):
+        self.assertEqual(self.tui(["space", "down", "space", "enter"]).checklist("t", self.items), ["a", "b"])
+        self.assertEqual(self.tui(["+", "enter"]).checklist("t", self.items), ["a", "b", "c"])
+        self.assertEqual(self.tui(["-", "enter"]).checklist("t", self.items, selected=["a"]), [])
+        tui = self.tui(["space", "down", "space", "enter"])
+        self.assertEqual(tui.checklist("t", self.items, limit=1), ["a"])
+        self.assertIn("At most 1", tui.out.getvalue())
+
+    def test_plain_number_ranges(self):
+        answers = iter(["1-2", ""])
+        tui = ph.Tui(out=io.StringIO(), read_line=lambda prompt="": next(answers))
+        self.assertEqual(tui.checklist("t", self.items), ["a", "b"])
 
 
 if __name__ == "__main__":
