@@ -621,6 +621,10 @@ def top_entries(elem):
 
 PANORAMA_DEVICE_XPATH = "/config/devices/entry[@name='localhost.localdomain']"
 SECTIONS = ["panorama", "devices", "sync", "jobs", "collectors", "rules", "certificates", "logs", "targeted"]
+# These read config (XML API 'Configuration' permission), which the lab key's admin role does not have,
+# so default runs leave them out. Ask for them with --sections or the menu's custom check.
+CONFIG_SECTIONS = ("rules", "certificates")
+DEFAULT_SECTIONS = [s for s in SECTIONS if s not in CONFIG_SECTIONS]
 
 
 QUICK_DEVICE_GROUPS = 2  # --quick: rules for shared + this many device groups
@@ -2506,8 +2510,13 @@ class MenuApp:
                 return 0
             self._safe(actions[choice])
 
+    @staticmethod
+    def default_sections():
+        """Sections of the full, quick and preview runs; the custom check offers every section."""
+        return [s for s in DEFAULT_SECTIONS if s != "targeted"]
+
     def main_items(self):
-        full = [s for s in self.mode_sections() if s != "targeted"]
+        full = self.default_sections()
         groups, templates = len(self.cache["groups"]), len(self.cache["templates"])
         dot = f" {self.tui.g['dot']} "
         reports = self._report_dirs()
@@ -2538,14 +2547,13 @@ class MenuApp:
     # ---- health checks ----
 
     def full_check(self):
-        self.execute("Full health check", [s for s in self.mode_sections() if s != "targeted"])
+        self.execute("Full health check", self.default_sections())
 
     def quick_check(self):
-        self.execute("Quick health check", [s for s in self.mode_sections() if s != "targeted"],
-                     max_groups=QUICK_DEVICE_GROUPS)
+        self.execute("Quick health check", self.default_sections(), max_groups=QUICK_DEVICE_GROUPS)
 
     def preview(self):
-        self.execute("Preview: full health check", [s for s in self.mode_sections() if s != "targeted"], dry=True)
+        self.execute("Preview: full health check", self.default_sections(), dry=True)
 
     def execute(self, title, sections, dry=False, settings=None, **scope):
         self.tui.screen(title + (" (dry run, nothing is sent)" if dry else ""))
@@ -3186,8 +3194,9 @@ def parse_args(argv):
     p.add_argument("--menu", action="store_true", help="open the interactive menu (default when run with no options)")
     p.add_argument("--dry-run", action="store_true", help="print the API calls that would be made; send nothing")
     p.add_argument("--diagnose", action="store_true", help="test API access and permissions, then exit")
-    p.add_argument("--sections", default=",".join(SECTIONS),
-                   help=f"comma-separated sections to collect (default: all). Choices: {','.join(SECTIONS)}")
+    p.add_argument("--sections", default=",".join(DEFAULT_SECTIONS),
+                   help=f"comma-separated sections to collect (default: all except {','.join(CONFIG_SECTIONS)}). "
+                        f"Choices: {','.join(SECTIONS)}")
     p.add_argument("--targeted", action="store_true",
                    help="also query each connected firewall through Panorama (overrides ENABLE_TARGETED)")
     p.add_argument("--firewalls", default="",
@@ -3195,9 +3204,10 @@ def parse_args(argv):
     p.add_argument("--format", default="html,csv", help="html, csv or html,csv (default)")
     p.add_argument("--output-dir", help="override OUTPUT_DIR")
     p.add_argument("--quick", action="store_true",
-                   help=f"fast proof-of-concept run: rules for shared + the first {QUICK_DEVICE_GROUPS} device groups")
+                   help=f"fast proof-of-concept run: rules for shared + the first {QUICK_DEVICE_GROUPS} device groups "
+                        "(when rules are in --sections)")
     p.add_argument("--device-groups", default="",
-                   help="comma-separated device groups to collect rules for (default: all)")
+                   help="comma-separated device groups to collect rules for (default: all; use with --sections rules)")
     return p.parse_args(argv)
 
 

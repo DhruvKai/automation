@@ -671,7 +671,7 @@ class EndToEndTests(unittest.TestCase):
         return code, fake, Path(tmp.name), out.getvalue()
 
     def test_full_run_writes_html_and_csv(self):
-        code, fake, out_dir, stdout = self.run_main("--targeted")
+        code, fake, out_dir, stdout = self.run_main("--targeted", "--sections", ",".join(ph.SECTIONS))
         self.assertEqual(code, 0, stdout)
         report_dir = next(p for p in out_dir.iterdir() if p.is_dir())
         names = {p.name for p in report_dir.iterdir()}
@@ -798,10 +798,19 @@ class EndToEndTests(unittest.TestCase):
         code, fake, out_dir, stdout = self.run_main("--dry-run", "--targeted")
         self.assertEqual(code, 0)
         self.assertEqual(fake.sent, [])
-        for call in ("op devices_all", "op disk_space", "op ntp", "config show /config/shared/certificate",
-                     "op dp_resources target=<serial>"):
+        for call in ("op devices_all", "op disk_space", "op ntp", "op dp_resources target=<serial>"):
             self.assertIn(call, stdout)
+        self.assertNotIn("config show", stdout)  # rules and certificates are opt-in
+        self.assertNotIn("config get", stdout)
         self.assertEqual(list(out_dir.glob("2*")), [])
+
+    def test_default_run_skips_config_sections(self):
+        code, fake, out_dir, stdout = self.run_main()
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual([p for p, _ in fake.sent if p["type"] == "config"], [])
+        report_dir = next(p for p in out_dir.iterdir() if p.is_dir())
+        errors = (report_dir / "collection_errors.csv").read_text(encoding="utf-8-sig")
+        self.assertEqual(errors.strip(), "section,error")
 
 
 class MenuTests(unittest.TestCase):
@@ -838,7 +847,7 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(self.op_calls(), [("devices_all", None), ("devicegroups", None), ("templates", None)])
         self.assertTrue(all("type" in p for p, _ in self.fake.sent), "the menu hit the REST API by default")
         for text in ("3 firewalls (1 not connected)", "1 device groups", "1 templates",
-                     "Full health check", "~21 calls", "Bye."):
+                     "Full health check", "~14 calls", "Bye."):
             self.assertIn(text, screen)
 
     def test_quick_check_writes_report_and_shows_results(self):
@@ -849,6 +858,7 @@ class MenuTests(unittest.TestCase):
         report = next(p for p in self.out_dir.iterdir() if p.is_dir())
         self.assertTrue((report / "report.html").exists())
         self.assertNotIn("SECRET-KEY", (report / "report.html").read_text(encoding="utf-8"))
+        self.assertFalse(any(p.get("type") == "config" for p, _ in self.fake.sent))
 
     def test_custom_check_uses_picked_sections_and_firewalls(self):
         # sections: none, then rules (6) + targeted (9); all device groups; firewalls capped at 1:
